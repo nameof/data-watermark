@@ -1,4 +1,4 @@
-package io.github.nameof.watermark.bit;
+package io.github.nameof.watermark.core.bit;
 
 import java.math.BigDecimal;
 

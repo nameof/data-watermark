@@ -1,4 +1,4 @@
-package io.github.nameof.watermark.bit;
+package io.github.nameof.watermark.core.bit;
 
 /**
  * 列级 bit-level 水印策略接口。
@@ -8,7 +8,7 @@ package io.github.nameof.watermark.bit;
  * </p>
  * <p>
  * 核心设计：每个策略只处理单个单元格中的一个 bit。
- * 上层引擎（DataWatermarker）负责将载荷编码为 bit 序列，
+ * 上层引擎（Watermarker）负责将载荷编码为 bit 序列，
  * 并通过冗余分配机制将多个 bit 分散到多个单元格中。
  * </p>
  */

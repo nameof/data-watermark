@@ -1,4 +1,4 @@
-package io.github.nameof.watermark.bit;
+package io.github.nameof.watermark.core.bit;
 
 /**
  * 中文文本水印策略 —— 零宽字符嵌入。

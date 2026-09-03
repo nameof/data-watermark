@@ -1,4 +1,4 @@
-package io.github.nameof.watermark.bit;
+package io.github.nameof.watermark.core.bit;
 
 /**
  * 列级 bit-level 水印嵌入结果。

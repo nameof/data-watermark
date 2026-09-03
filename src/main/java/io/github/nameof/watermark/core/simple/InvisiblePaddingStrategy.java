@@ -1,4 +1,4 @@
-package io.github.nameof.watermark.simple;
+package io.github.nameof.watermark.core.simple;
 
 import java.nio.charset.StandardCharsets;
 

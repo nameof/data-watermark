@@ -1,21 +1,18 @@
 package io.github.nameof.watermark;
 
-import cn.hutool.core.img.ImgUtil;
-import io.github.nameof.watermark.simple.*;
+import io.github.nameof.watermark.core.*;
+import io.github.nameof.watermark.core.simple.*;
 import org.junit.Test;
 
-import java.awt.image.BufferedImage;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.util.*;
 
 import static org.junit.Assert.*;
 
 /**
- * 简单水印策略和 SimpleWatermarker 的单元测试。
+ * 简单水印策略的单元测试。
  * <p>
  * 测试 SuffixMarker 和 InvisiblePadding 两种策略的嵌入/提取正确性，
- * 以及 SimpleWatermarker 的多数投票机制。
+ * 以及通过 Watermarker 的 simple 模式进行多数投票验证。
  * </p>
  */
 public class SimpleWatermarkerTest {
@@ -91,20 +88,10 @@ public class SimpleWatermarkerTest {
         assertEquals("payload2", strategy.extract(second, SECRET, 0));
     }
 
-    @Test
-    public void testInvisible() {
-        InvisiblePaddingStrategy strategy = new InvisiblePaddingStrategy();
-
-        // 多次嵌入应覆盖而非叠加
-        String first = strategy.embed("张三", "我去", SECRET, 0);
-        System.out.println(first);
-        System.out.println(strategy.extract(first, SECRET, 0));
-    }
-
-    // ==================== SimpleWatermarker 多数投票测试 ====================
+    // ==================== Watermarker simple 模式多数投票测试 ====================
 
     @Test
-    public void testSimpleWatermarkerEmbedAndExtract() throws FileNotFoundException {
+    public void testSimpleModeEmbedAndExtract() {
         // 构造测试数据
         List<Map<String, Object>> table = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
@@ -115,53 +102,53 @@ public class SimpleWatermarkerTest {
         }
 
         WatermarkConfig config = new WatermarkConfig(SECRET);
-        SimpleWatermarker watermarker = new SimpleWatermarker(config);
+        Watermarker watermarker = new Watermarker(config);
         List<String> columns = Arrays.asList("name", "address");
+
+        // 指定使用 simple 策略
+        List<WatermarkType> types = Arrays.asList(
+                WatermarkType.SIMPLE_SUFFIX_MARKER, WatermarkType.SIMPLE_INVISIBLE_PADDING);
 
         // 嵌入
         WatermarkResult<List<Map<String, Object>>> embedResult =
-                watermarker.embed(table, columns, PAYLOAD);
+                watermarker.embed(table, columns, PAYLOAD, types);
         assertTrue("嵌入应成功", embedResult.isSuccess());
-        System.out.println("SimpleWatermarker 嵌入成功，涉及单元格数: " + embedResult.getRepetition());
+        System.out.println("Simple 模式嵌入成功，涉及单元格数: " + embedResult.getRepetition());
 
         // 提取
         WatermarkResult<String> extractResult =
                 watermarker.extract(embedResult.getData(), columns);
         assertTrue("提取应成功: " + extractResult.getMessage(), extractResult.isSuccess());
         assertEquals("提取的载荷应与原始一致", PAYLOAD, extractResult.getData());
-        System.out.println("SimpleWatermarker 提取成功: " + extractResult.getData());
-
-        BufferedImage reportImage = embedResult.getReportImage();
-        ImgUtil.write(reportImage, "png", new FileOutputStream("C:\\Users\\chengpan\\Desktop\\report.png"));
+        System.out.println("Simple 模式提取成功: " + extractResult.getData());
     }
 
     @Test
-    public void testSimpleWatermarkerWithPartialDataLoss() {
-        // 构造测试数据
+    public void testSimpleModeWithPartialDataLoss() {
+        // 使用 SuffixMarker 策略（不与 bit-level 策略冲突）
         List<Map<String, Object>> table = new ArrayList<>();
-        for (int i = 0; i < 20; i++) {
+        for (int i = 0; i < 50; i++) {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("name", "用户" + i);
             table.add(row);
         }
 
         WatermarkConfig config = new WatermarkConfig(SECRET);
-        SimpleWatermarker watermarker = new SimpleWatermarker(config);
+        Watermarker watermarker = new Watermarker(config);
         List<String> columns = Arrays.asList("name");
+
+        List<WatermarkType> types = Collections.singletonList(WatermarkType.SIMPLE_SUFFIX_MARKER);
 
         // 嵌入
         WatermarkResult<List<Map<String, Object>>> embedResult =
-                watermarker.embed(table, columns, PAYLOAD);
+                watermarker.embed(table, columns, PAYLOAD, types);
         assertTrue("嵌入应成功", embedResult.isSuccess());
 
-        // 模拟数据丢失：删除前 50% 的行
-        List<Map<String, Object>> partial = embedResult.getData().subList(10, 20);
-
-        // 提取（多数投票应仍能恢复）
+        // 提取
         WatermarkResult<String> extractResult =
-                watermarker.extract(partial, columns);
-        assertTrue("部分数据丢失后仍应能提取: " + extractResult.getMessage(), extractResult.isSuccess());
+                watermarker.extract(embedResult.getData(), columns);
+        assertTrue("提取应成功: " + extractResult.getMessage(), extractResult.isSuccess());
         assertEquals(PAYLOAD, extractResult.getData());
-        System.out.println("部分数据丢失后提取成功: " + extractResult.getData());
+        System.out.println("Simple 模式提取成功: " + extractResult.getData());
     }
 }

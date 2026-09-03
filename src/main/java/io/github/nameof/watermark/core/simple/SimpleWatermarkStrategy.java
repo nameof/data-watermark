@@ -1,4 +1,4 @@
-package io.github.nameof.watermark.simple;
+package io.github.nameof.watermark.core.simple;
 
 /**
  * 简单水印策略接口。

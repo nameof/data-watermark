@@ -1,4 +1,4 @@
-package io.github.nameof.watermark;
+package io.github.nameof.watermark.core;
 
 /**
  * 水印配置类，封装水印嵌入/提取所需的参数。
@@ -19,36 +19,50 @@ public class WatermarkConfig {
     private final int minRepetition;
 
     /**
-     * 是否使用 bit-level 水印模式。
-     * true = bit-level（高隐蔽性、高健壮性），false = simple（简单字符串水印）。
-     * 默认为 true。
+     * 切片行数，供 Database 层使用。
+     * 默认值为 2000。
      */
-    private boolean useBitLevel = true;
+    private final int chunkSize;
 
     /**
-     * 使用默认最小重复因子（5）创建配置。
+     * 使用默认参数创建配置（minRepetition=5, chunkSize=2000）。
      *
      * @param secret 密钥
      */
     public WatermarkConfig(String secret) {
-        this(secret, 5);
+        this(secret, 5, 2000);
     }
 
     /**
-     * 使用指定的最小重复因子创建配置。
+     * 使用指定的最小重复因子创建配置（chunkSize=2000）。
      *
      * @param secret        密钥
      * @param minRepetition 最小重复因子，必须 >= 3
      */
     public WatermarkConfig(String secret, int minRepetition) {
+        this(secret, minRepetition, 2000);
+    }
+
+    /**
+     * 使用指定参数创建配置。
+     *
+     * @param secret        密钥
+     * @param minRepetition 最小重复因子，必须 >= 3
+     * @param chunkSize     切片行数，默认 2000
+     */
+    public WatermarkConfig(String secret, int minRepetition, int chunkSize) {
         if (secret == null || secret.isEmpty()) {
             throw new IllegalArgumentException("密钥不能为空");
         }
         if (minRepetition < 3) {
             throw new IllegalArgumentException("最小重复因子必须 >= 3");
         }
+        if (chunkSize < 1) {
+            throw new IllegalArgumentException("切片行数必须 >= 1");
+        }
         this.secret = secret;
         this.minRepetition = minRepetition;
+        this.chunkSize = chunkSize;
     }
 
     public String getSecret() {
@@ -59,21 +73,7 @@ public class WatermarkConfig {
         return minRepetition;
     }
 
-    /**
-     * 是否使用 bit-level 水印模式。
-     */
-    public boolean isUseBitLevel() {
-        return useBitLevel;
-    }
-
-    /**
-     * 设置是否使用 bit-level 水印模式。
-     *
-     * @param useBitLevel true = bit-level，false = simple
-     * @return this（支持链式调用）
-     */
-    public WatermarkConfig setUseBitLevel(boolean useBitLevel) {
-        this.useBitLevel = useBitLevel;
-        return this;
+    public int getChunkSize() {
+        return chunkSize;
     }
 }

@@ -1,4 +1,4 @@
-package io.github.nameof.watermark.bit;
+package io.github.nameof.watermark.core.bit;
 
 /**
  * 拉丁文本水印策略 —— Homoglyph（同形字）替换。

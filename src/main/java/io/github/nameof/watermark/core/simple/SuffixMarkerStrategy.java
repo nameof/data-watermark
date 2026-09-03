@@ -1,4 +1,4 @@
-package io.github.nameof.watermark.simple;
+package io.github.nameof.watermark.core.simple;
 
 /**
  * 后缀标记策略 —— 在文本的<b>随机位置</b>插入可见标记。

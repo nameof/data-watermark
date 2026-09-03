@@ -1,13 +1,12 @@
-package io.github.nameof.watermark;
+package io.github.nameof.watermark.core;
 
-import java.awt.image.BufferedImage;
 import java.util.Collections;
 import java.util.List;
 
 /**
  * 水印操作结果，用于 embed 和 extract 方法的返回值。
  *
- * @param <T> 结果数据类型（embed 返回 List<Map<String,Object>>，extract 返回 String）
+ * @param <T> 结果数据类型（embed 时为 {@code List<Map<String,Object>>}，extract 时为 {@link String}）
  */
 public class WatermarkResult<T> {
 
@@ -26,8 +25,8 @@ public class WatermarkResult<T> {
     /** 实际使用的重复因子 */
     private final int repetition;
 
-    /** 水印模式：bit-level 或 simple */
-    private String watermarkMode;
+    /** 使用的水印类型 */
+    private WatermarkType watermarkType;
 
     /** 可嵌入/可提取的总单元格数 */
     private int totalCells;
@@ -72,7 +71,7 @@ public class WatermarkResult<T> {
      * 创建成功的通用结果（支持任意数据类型）。
      *
      * @param data              结果数据
-     * @param watermarkedColumns 涉及的列名列表
+     * @param watermarkedColumns 涉及列名列表
      * @param repetition        重复因子
      * @param <T>               结果数据类型
      * @return 成功的结果
@@ -109,24 +108,34 @@ public class WatermarkResult<T> {
         return repetition;
     }
 
-    // ==================== 报告元数据 ====================
+    // ==================== 水印类型 ====================
 
     /**
-     * 获取水印模式。
-     *
-     * @return "bit-level" 或 "simple"
+     * 获取使用的水印类型。
      */
-    public String getWatermarkMode() {
-        return watermarkMode;
+    public WatermarkType getWatermarkType() {
+        return watermarkType;
     }
 
     /**
-     * 设置水印模式（内部使用）。
+     * 设置水印类型（内部使用）。
      */
-    public WatermarkResult<T> setWatermarkMode(String watermarkMode) {
-        this.watermarkMode = watermarkMode;
+    public WatermarkResult<T> setWatermarkType(WatermarkType watermarkType) {
+        this.watermarkType = watermarkType;
         return this;
     }
+
+    /**
+     * 获取水印模式（从 watermarkType 派生）。
+     *
+     * @return "bit-level"、"simple" 或 "unknown"
+     */
+    public String getWatermarkMode() {
+        return watermarkType != null ? watermarkType.getMode().name().toLowerCase().replace("_", "-")
+                : "unknown";
+    }
+
+    // ==================== 报告元数据 ====================
 
     /**
      * 获取可嵌入/可提取的总单元格数。
@@ -175,29 +184,13 @@ public class WatermarkResult<T> {
         return this;
     }
 
-    // ==================== 报告图片 ====================
-
-    /**
-     * 生成水印提取报告图片。
-     * <p>
-     * 使用 Java 2D 生成一张可视化的报告图片，包含提取时间、水印模式、
-     * 重复因子、校验状态、还原载荷、提取统计等信息。
-     * 可作为数据泄露追责的证据展示。
-     * </p>
-     *
-     * @return 报告图片，可通过 ImageIO 写入文件
-     * @throws IllegalStateException 如果此结果不是提取结果（无水印模式信息）
-     */
-    public BufferedImage getReportImage() {
-        return WatermarkReportGenerator.generateReport(this);
-    }
-
     @Override
     public String toString() {
         if (success) {
             return "WatermarkResult{success=true, data=" + data
                     + ", watermarkedColumns=" + watermarkedColumns
-                    + ", repetition=" + repetition + "}";
+                    + ", repetition=" + repetition
+                    + ", watermarkType=" + watermarkType + "}";
         } else {
             return "WatermarkResult{success=false, message='" + message + "'}";
         }
