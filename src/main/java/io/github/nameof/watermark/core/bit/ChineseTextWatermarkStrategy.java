@@ -1,5 +1,7 @@
 package io.github.nameof.watermark.core.bit;
 
+import io.github.nameof.watermark.core.WatermarkType;
+
 /**
  * 中文文本水印策略 —— 零宽字符嵌入。
  * <p>
@@ -19,7 +21,7 @@ package io.github.nameof.watermark.core.bit;
  * 适用场景：中文文本列（姓名、地址等），要求肉眼不可见。
  * </p>
  */
-public class ChineseTextWatermarkStrategy implements ColumnWatermarkStrategy {
+public class ChineseTextWatermarkStrategy implements BitCarrierStrategy {
 
     /** 零宽空格 - 编码 bit 0 */
     private static final char ZWSP = '\u200B';
@@ -29,6 +31,11 @@ public class ChineseTextWatermarkStrategy implements ColumnWatermarkStrategy {
 
     /** 文本最小长度要求（至少需要几个字符才能嵌入水印） */
     private static final int MIN_LENGTH = 2;
+
+    @Override
+    public WatermarkType type() {
+        return WatermarkType.BIT_CHINESE_ZERO_WIDTH;
+    }
 
     @Override
     public boolean canWatermark(Object value) {
@@ -42,17 +49,17 @@ public class ChineseTextWatermarkStrategy implements ColumnWatermarkStrategy {
     }
 
     @Override
-    public ColumnEmbedResult embed(Object value, int bit, String secret, int row, int col) {
+    public BitEmbedResult embed(Object value, int bit, String secret, long seed) {
         String str = value.toString();
         // 先清除已有零宽字符，避免多次嵌入叠加
         String cleaned = removeZeroWidthChars(str);
 
         if (cleaned.length() < MIN_LENGTH) {
-            return new ColumnEmbedResult(value, false);
+            return new BitEmbedResult(value, false);
         }
 
-        // 用哈希确定插入位置，使不同单元格在不同位置嵌入（增加攻击者定位难度）
-        int pos = Math.abs(hashPosition(secret, row, col)) % cleaned.length();
+        // 用密钥 + 种子确定插入位置，使不同值在不同位置嵌入（增加攻击者定位难度）
+        int pos = Math.abs(hashPosition(secret, seed)) % cleaned.length();
 
         // 根据 bit 值选择零宽字符
         char zwChar = (bit == 1) ? ZWNJ : ZWSP;
@@ -65,11 +72,11 @@ public class ChineseTextWatermarkStrategy implements ColumnWatermarkStrategy {
             sb.append(cleaned.substring(pos + 1));
         }
 
-        return new ColumnEmbedResult(sb.toString(), true);
+        return new BitEmbedResult(sb.toString(), true);
     }
 
     @Override
-    public int extract(Object value, String secret, int row, int col) {
+    public int extract(Object value, String secret, long seed) {
         if (value == null) {
             return -1;
         }
@@ -105,13 +112,12 @@ public class ChineseTextWatermarkStrategy implements ColumnWatermarkStrategy {
     }
 
     /**
-     * 基于密钥和位置信息计算哈希位置。
-     * 使用混合函数确保不同 (secret, row, col) 组合产生不同的插入位置。
+     * 基于密钥和位置种子计算哈希位置。
+     * 使用混合函数确保不同 (secret, seed) 组合产生不同的插入位置。
      */
-    private int hashPosition(String secret, int row, int col) {
+    private int hashPosition(String secret, long seed) {
         long hash = secret.hashCode();
-        hash = hash * 31 + row;
-        hash = hash * 31 + col;
+        hash = hash * 31 + seed;
         hash = (hash ^ (hash >>> 16)) * 0x45D9F3B;
         hash = (hash ^ (hash >>> 16));
         return (int) hash;

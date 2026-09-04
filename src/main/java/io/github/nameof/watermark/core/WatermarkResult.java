@@ -28,11 +28,11 @@ public class WatermarkResult<T> {
     /** 使用的水印类型 */
     private WatermarkType watermarkType;
 
-    /** 可嵌入/可提取的总单元格数 */
-    private int totalCells;
+    /** 可嵌入/可提取的总单元格数，-1 表示未计算 */
+    private int totalCells = -1;
 
-    /** 成功提取的单元格数 */
-    private int validExtractions;
+    /** 成功提取的单元格数，-1 表示未计算 */
+    private int validExtractions = -1;
 
     /** 提取置信度（0-100%），-1 表示未计算 */
     private double confidence = -1;

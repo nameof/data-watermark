@@ -1,6 +1,9 @@
 package io.github.nameof.watermark.core.bit;
 
+import io.github.nameof.watermark.core.WatermarkType;
+
 import java.math.BigDecimal;
+import java.util.Locale;
 
 /**
  * 数值水印策略 —— 末位微扰。
@@ -25,7 +28,12 @@ import java.math.BigDecimal;
  * 如果数值被四舍五入到更低的精度，水印可能会丢失。
  * </p>
  */
-public class NumericWatermarkStrategy implements ColumnWatermarkStrategy {
+public class NumericWatermarkStrategy implements BitCarrierStrategy {
+
+    @Override
+    public WatermarkType type() {
+        return WatermarkType.BIT_NUMERIC_LSB;
+    }
 
     @Override
     public boolean canWatermark(Object value) {
@@ -44,7 +52,7 @@ public class NumericWatermarkStrategy implements ColumnWatermarkStrategy {
     }
 
     @Override
-    public ColumnEmbedResult embed(Object value, int bit, String secret, int row, int col) {
+    public BitEmbedResult embed(Object value, int bit, String secret, long seed) {
         double num = toDouble(value);
         int precision = getPrecision(value);
 
@@ -71,11 +79,11 @@ public class NumericWatermarkStrategy implements ColumnWatermarkStrategy {
         // 保持原始类型
         Object resultValue = preserveType(value, result, precision);
 
-        return new ColumnEmbedResult(resultValue, true);
+        return new BitEmbedResult(resultValue, true);
     }
 
     @Override
-    public int extract(Object value, String secret, int row, int col) {
+    public int extract(Object value, String secret, long seed) {
         if (value == null) {
             return -1;
         }
@@ -137,7 +145,7 @@ public class NumericWatermarkStrategy implements ColumnWatermarkStrategy {
             if (precision == 0) {
                 return String.valueOf((long) result);
             }
-            return String.format("%." + precision + "f", result);
+            return String.format(Locale.ROOT, "%." + precision + "f", result);
         }
         // 对于 BigDecimal，保持类型以避免精度丢失
         if (original instanceof BigDecimal) {

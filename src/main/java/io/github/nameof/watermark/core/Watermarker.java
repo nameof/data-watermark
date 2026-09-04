@@ -1,7 +1,13 @@
 package io.github.nameof.watermark.core;
 
-import io.github.nameof.watermark.core.bit.*;
-import io.github.nameof.watermark.core.simple.*;
+import io.github.nameof.watermark.core.bit.BitCarrierStrategy;
+import io.github.nameof.watermark.core.bit.BitEmbedResult;
+import io.github.nameof.watermark.core.bit.ChineseTextWatermarkStrategy;
+import io.github.nameof.watermark.core.bit.LatinTextWatermarkStrategy;
+import io.github.nameof.watermark.core.bit.NumericWatermarkStrategy;
+import io.github.nameof.watermark.core.simple.InvisiblePaddingStrategy;
+import io.github.nameof.watermark.core.simple.SimpleWatermarkStrategy;
+import io.github.nameof.watermark.core.simple.SuffixMarkerStrategy;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -9,17 +15,31 @@ import java.util.*;
 /**
  * 核心统一水印 API —— 合并 bit-level 和 simple 两种水印模式。
  *
- * <h2>设计原理</h2>
+ * <h2>架构分层</h2>
+ * <p>本类处于<b>编码/扩频层</b>，与策略层（载体层）职责分离：</p>
  * <ol>
- *   <li><b>多策略嵌入</b>：根据列的数据类型自动选择嵌入策略
- *       （中文→零宽字符、拉丁文→同形字替换、数值→末位微扰、文本→后缀标记/零宽填充）</li>
- *   <li><b>两段式编码</b>（bit-level 模式）：前 HEADER_BITS×3 = 24 个单元格编码 8-bit 长度头部，
- *       剩余单元格编码载荷+CRC32。提取时先读头部确定精确长度，无需猜测。</li>
- *   <li><b>交叉分配</b>（bit-level 模式）：每个 bit 的 R 个副本均匀分布在整个数据范围内
- *       （cell j → bit j%N），删除任意连续区域只影响每个 bit 的少量副本，
- *       通过多数投票恢复，容忍高达 (R-1)/R 比例的数据丢失。</li>
- *   <li><b>独立编码</b>（simple 模式）：每个单元格独立承载完整载荷，提取时做多数投票。</li>
+ *   <li><b>载体层（策略，单值粒度）</b>：{@link BitCarrierStrategy} 负责在单个值中
+ *       隐蔽地嵌入/提取 1 bit（零宽字符、同形字、末位微扰），
+ *       {@link SimpleWatermarkStrategy} 负责在单个值中承载完整载荷。
+ *       策略只做单值变换，通过 {@code seed}（由本类从值的稳定标识计算）
+ *       选择嵌入位置，完全不感知数据集形态。</li>
+ *   <li><b>编码/扩频层（本类，多值粒度）</b>：一次完整水印的嵌入天然需要多个值。
+ *       本类负责把载荷编码为 bit 流，并冗余分布到整个数据集：
+ *       <ul>
+ *         <li><b>两段式编码</b>（bit-level 模式）：前 HEADER_BITS×3 = 24 个单元格编码
+ *             8-bit 长度头部，剩余单元格编码载荷+CRC32。提取时先读头部确定精确长度。</li>
+ *         <li><b>交叉分配</b>（bit-level 模式）：每个 bit 的 R 个副本均匀分布在整个
+ *             数据范围内（cell j → bit j%N），删除任意连续区域只影响每个 bit 的少量副本，
+ *             通过多数投票恢复，容忍高达 (R-1)/R 比例的数据丢失。</li>
+ *         <li><b>独立编码</b>（simple 模式）：每个单元格独立承载完整载荷，提取时做多数投票。</li>
+ *         <li><b>密钥流置乱</b>（bit-level 模式）：载荷 bit 在嵌入前与密钥派生的
+ *             0/1 密钥流异或，提取时对称还原——不知道密钥则 CRC32 校验失败，
+ *             无法读出载荷（长度头部不做置乱）。</li>
+ *       </ul></li>
  * </ol>
+ * <p>当前公开 API 面向表格数据（{@code List<Map<String,Object>>} + 列名）；
+ * 由于策略层已与表格坐标解耦（seed 化），未来支持非表格数据集
+ * （文档、JSON 等）时只需增加新的数据集展平入口，复用全部策略与编码逻辑。</p>
  *
  * <h2>容量需求（bit-level）</h2>
  * <p>
@@ -43,15 +63,18 @@ public class Watermarker {
     private static final int HEADER_REP = 3;
     /** 头部占用单元格数 */
     private static final int HEADER_CELLS = HEADER_BITS * HEADER_REP; // 24
+    /** 载荷最大字节数（UTF-8），受 8-bit 头部长度字段约束并为编码开销留余量 */
+    public static final int MAX_PAYLOAD_BYTES = 251;
 
     private final WatermarkConfig config;
-    private final List<ColumnWatermarkStrategy> bitStrategies;
+    private final List<BitCarrierStrategy> bitStrategies;
     private final List<SimpleWatermarkStrategy> simpleStrategies;
 
     /**
      * 使用默认策略创建 Watermarker。
      * <p>
-     * 默认 bit-level 策略：ChineseText、LatinText、Numeric；
+     * 默认 bit-level 策略（按<b>最具体优先</b>的顺序注册与匹配）：
+     * Numeric（仅数值）、LatinText（含可替换拉丁字符）、ChineseText（任意 ≥2 字符文本，最泛化）；
      * 默认 simple 策略：SuffixMarker、InvisiblePadding。
      * </p>
      *
@@ -60,9 +83,13 @@ public class Watermarker {
     public Watermarker(WatermarkConfig config) {
         this.config = config;
         this.bitStrategies = new ArrayList<>();
-        bitStrategies.add(new ChineseTextWatermarkStrategy());
-        bitStrategies.add(new LatinTextWatermarkStrategy());
+        // 注册顺序即匹配顺序，必须"最具体优先"：
+        // ChineseText 对任意 ≥2 字符的值都返回 canWatermark=true，
+        // 若排在前面会吞掉所有值，Numeric/Latin 永远无法被分发。
+        // 嵌入与提取共用同一顺序，保证同一值在两端路由到同一策略。
         bitStrategies.add(new NumericWatermarkStrategy());
+        bitStrategies.add(new LatinTextWatermarkStrategy());
+        bitStrategies.add(new ChineseTextWatermarkStrategy());
         this.simpleStrategies = new ArrayList<>();
         simpleStrategies.add(new SuffixMarkerStrategy());
         simpleStrategies.add(new InvisiblePaddingStrategy());
@@ -70,17 +97,22 @@ public class Watermarker {
 
     /**
      * 使用自定义策略创建 Watermarker。
+     * <p>
+     * 注意：策略列表的顺序即值匹配顺序，应按"最具体优先"排列
+     * （先匹配窄条件的策略，最后才是泛化策略），否则泛化策略会吞掉所有值。
+     * 嵌入与提取共用此顺序。
+     * </p>
      *
-     * @param config          水印配置
-     * @param bitStrategies   bit-level 策略列表，可为 null
+     * @param config           水印配置
+     * @param bitStrategies    bit-level 策略列表，可为 null
      * @param simpleStrategies simple 策略列表，可为 null
      */
     public Watermarker(WatermarkConfig config,
-                       List<ColumnWatermarkStrategy> bitStrategies,
+                       List<BitCarrierStrategy> bitStrategies,
                        List<SimpleWatermarkStrategy> simpleStrategies) {
         this.config = config;
-        this.bitStrategies = bitStrategies != null ? new ArrayList<>(bitStrategies) : new ArrayList<>();
-        this.simpleStrategies = simpleStrategies != null ? new ArrayList<>(simpleStrategies) : new ArrayList<>();
+        this.bitStrategies = bitStrategies != null ? new ArrayList<>(bitStrategies) : new ArrayList<BitCarrierStrategy>();
+        this.simpleStrategies = simpleStrategies != null ? new ArrayList<>(simpleStrategies) : new ArrayList<SimpleWatermarkStrategy>();
     }
 
     // ==================== 公开 API ====================
@@ -100,14 +132,14 @@ public class Watermarker {
             for (Map<String, Object> row : table) {
                 Object value = row.get(col);
                 if (value == null) continue;
-                for (int i = 0; i < bitStrategies.size(); i++) {
-                    if (bitStrategies.get(i).canWatermark(value)) {
-                        result.add(bitLevelType(i));
+                for (BitCarrierStrategy s : bitStrategies) {
+                    if (s.canWatermark(value)) {
+                        result.add(s.type());
                     }
                 }
-                for (int i = 0; i < simpleStrategies.size(); i++) {
-                    if (simpleStrategies.get(i).canWatermark(value)) {
-                        result.add(simpleType(i));
+                for (SimpleWatermarkStrategy s : simpleStrategies) {
+                    if (s.canWatermark(value)) {
+                        result.add(s.type());
                     }
                 }
             }
@@ -135,6 +167,15 @@ public class Watermarker {
             return WatermarkResult.failure("表数据为空");
         if (payload == null || payload.isEmpty())
             return WatermarkResult.failure("水印载荷为空");
+        if (columns == null || columns.isEmpty())
+            return WatermarkResult.failure("列名列表为空");
+
+        // 载荷长度校验（UTF-8 字节数），统一以 failure 结果返回而非抛出异常
+        int payloadBytes = payload.getBytes(StandardCharsets.UTF_8).length;
+        if (payloadBytes > MAX_PAYLOAD_BYTES) {
+            return WatermarkResult.failure("水印载荷过长: " + payloadBytes
+                    + " 字节，最大支持 " + MAX_PAYLOAD_BYTES + " 字节");
+        }
 
         // 确定要使用的策略
         boolean useBit = true;
@@ -180,6 +221,8 @@ public class Watermarker {
     public WatermarkResult<String> extract(List<Map<String, Object>> table, List<String> columns) {
         if (table == null || table.isEmpty())
             return WatermarkResult.failure("表数据为空");
+        if (columns == null || columns.isEmpty())
+            return WatermarkResult.failure("列名列表为空");
 
         // 尝试两种模式的提取
         WatermarkResult<String> bitResult = extractBitLevel(table, columns);
@@ -219,9 +262,11 @@ public class Watermarker {
         if (M <= HEADER_CELLS)
             return WatermarkResult.failure("可嵌入单元格不足（" + M + "个），至少需要 " + (HEADER_CELLS + 1) + " 个");
 
-        // 2. 编码载荷
+        // 2. 编码载荷，并用密钥流置乱 bit —— 使提取依赖密钥（错误密钥 → CRC32 校验失败）
         byte[] encoded = encodePayload(payload);
         int[] payloadBits = bytesToBits(encoded);
+        int[] keyStream = keyStream(payloadBits.length);
+        for (int i = 0; i < payloadBits.length; i++) payloadBits[i] ^= keyStream[i];
         int N = payloadBits.length;
 
         // 3. 容量检查
@@ -248,11 +293,10 @@ public class Watermarker {
             int bitPos = i / HEADER_REP;
             CellRef cell = cells.get(i);
             Object value = result.get(cell.row).get(cell.column);
-            ColumnWatermarkStrategy strategy = findBitStrategy(value, types);
+            BitCarrierStrategy strategy = findBitStrategy(value, types);
             if (strategy != null) {
-                int sr = scramble(cell.row, config.getSecret());
-                int sc = scramble(cell.colIndex, config.getSecret());
-                ColumnEmbedResult er = strategy.embed(value, headerBits[bitPos], config.getSecret(), sr, sc);
+                long seed = cellSeed(cell.row, cell.colIndex);
+                BitEmbedResult er = strategy.embed(value, headerBits[bitPos], config.getSecret(), seed);
                 if (er.isEmbedded()) {
                     result.get(cell.row).put(cell.column, er.getValue());
                 }
@@ -264,11 +308,10 @@ public class Watermarker {
             int bitPos = i % N;
             CellRef cell = cells.get(HEADER_CELLS + i);
             Object value = result.get(cell.row).get(cell.column);
-            int sr = scramble(cell.row, config.getSecret());
-            int sc = scramble(cell.colIndex, config.getSecret());
-            ColumnWatermarkStrategy strategy = findBitStrategy(value, types);
+            long seed = cellSeed(cell.row, cell.colIndex);
+            BitCarrierStrategy strategy = findBitStrategy(value, types);
             if (strategy != null) {
-                ColumnEmbedResult er = strategy.embed(value, payloadBits[bitPos], config.getSecret(), sr, sc);
+                BitEmbedResult er = strategy.embed(value, payloadBits[bitPos], config.getSecret(), seed);
                 if (er.isEmbedded()) {
                     result.get(cell.row).put(cell.column, er.getValue());
                 }
@@ -311,11 +354,10 @@ public class Watermarker {
             int ones = 0, total = 0;
             for (int j = b * HEADER_REP; j < (b + 1) * HEADER_REP && j < M; j++) {
                 CellRef cell = cells.get(j);
-                ColumnWatermarkStrategy strategy = findAnyBitStrategy(cell.value);
+                BitCarrierStrategy strategy = findAnyBitStrategy(cell.value);
                 if (strategy != null) {
-                    int sr = scramble(cell.row, config.getSecret());
-                    int sc = scramble(cell.colIndex, config.getSecret());
-                    int bit = strategy.extract(cell.value, config.getSecret(), sr, sc);
+                    long seed = cellSeed(cell.row, cell.colIndex);
+                    int bit = strategy.extract(cell.value, config.getSecret(), seed);
                     if (bit >= 0) {
                         total++;
                         if (bit == 1) ones++;
@@ -344,11 +386,10 @@ public class Watermarker {
         for (int i = 0; i < payloadCells; i++) {
             int bitPos = i % N;
             CellRef cell = cells.get(HEADER_CELLS + i);
-            ColumnWatermarkStrategy strategy = findAnyBitStrategy(cell.value);
+            BitCarrierStrategy strategy = findAnyBitStrategy(cell.value);
             if (strategy != null) {
-                int sr = scramble(cell.row, config.getSecret());
-                int sc = scramble(cell.colIndex, config.getSecret());
-                int bit = strategy.extract(cell.value, config.getSecret(), sr, sc);
+                long seed = cellSeed(cell.row, cell.colIndex);
+                int bit = strategy.extract(cell.value, config.getSecret(), seed);
                 if (bit >= 0) {
                     totalCount[bitPos]++;
                     if (bit == 1) onesCount[bitPos]++;
@@ -356,11 +397,13 @@ public class Watermarker {
             }
         }
 
-        // 4. 多数投票恢复 bits
+        // 4. 多数投票恢复 bits，再用同一密钥流还原（嵌入时做过对称置乱）
         int[] recovered = new int[N];
         for (int b = 0; b < N; b++) {
             recovered[b] = (totalCount[b] > 0 && onesCount[b] > totalCount[b] / 2) ? 1 : 0;
         }
+        int[] keyStream = keyStream(N);
+        for (int b = 0; b < N; b++) recovered[b] ^= keyStream[b];
 
         // 5. 解码并验证 CRC32
         byte[] bytes = bitsToBytes(recovered);
@@ -422,7 +465,8 @@ public class Watermarker {
 
                 SimpleWatermarkStrategy strategy = findSimpleStrategy(value, types);
                 if (strategy != null) {
-                    String embedded = strategy.embed(value, payload, config.getSecret(), r);
+                    long seed = rowSeed(r);
+                    String embedded = strategy.embed(value, payload, config.getSecret(), seed);
                     row.put(col, embedded);
                     embeddedCount++;
                     usedColumns.add(col);
@@ -461,7 +505,8 @@ public class Watermarker {
 
                 SimpleWatermarkStrategy strategy = findAnySimpleStrategy(value);
                 if (strategy != null) {
-                    String extracted = strategy.extract(value, config.getSecret(), r);
+                    long seed = rowSeed(r);
+                    String extracted = strategy.extract(value, config.getSecret(), seed);
                     if (extracted != null) {
                         votes.merge(extracted, 1, Integer::sum);
                         totalExtracted++;
@@ -519,16 +564,16 @@ public class Watermarker {
             if (R >= config.getMinRepetition()) {
                 // bit-level 容量足够，收集实际支持的 bit-level 类型
                 List<WatermarkType> bitTypes = new ArrayList<>();
-                for (int i = 0; i < bitStrategies.size(); i++) {
+                for (BitCarrierStrategy s : bitStrategies) {
                     for (Map<String, Object> row : table) {
                         for (String col : columns) {
                             Object v = row.get(col);
-                            if (v != null && bitStrategies.get(i).canWatermark(v)) {
-                                bitTypes.add(bitLevelType(i));
+                            if (v != null && s.canWatermark(v)) {
+                                bitTypes.add(s.type());
                                 break;
                             }
                         }
-                        if (!bitTypes.isEmpty() && bitTypes.contains(bitLevelType(i))) break;
+                        if (bitTypes.contains(s.type())) break;
                     }
                 }
                 if (!bitTypes.isEmpty()) return bitTypes;
@@ -537,30 +582,30 @@ public class Watermarker {
 
         // 降级到 simple
         List<WatermarkType> simpleTypes = new ArrayList<>();
-        for (int i = 0; i < simpleStrategies.size(); i++) {
+        for (SimpleWatermarkStrategy s : simpleStrategies) {
             for (Map<String, Object> row : table) {
                 for (String col : columns) {
                     Object v = row.get(col);
-                    if (v != null && simpleStrategies.get(i).canWatermark(v)) {
-                        simpleTypes.add(simpleType(i));
+                    if (v != null && s.canWatermark(v)) {
+                        simpleTypes.add(s.type());
                         break;
                     }
                 }
-                if (!simpleTypes.isEmpty() && simpleTypes.contains(simpleType(i))) break;
+                if (simpleTypes.contains(s.type())) break;
             }
         }
         if (!simpleTypes.isEmpty()) return simpleTypes;
 
         // 兜底：返回所有 bit-level 类型
         List<WatermarkType> fallback = new ArrayList<>();
-        for (int i = 0; i < bitStrategies.size(); i++) fallback.add(bitLevelType(i));
+        for (BitCarrierStrategy s : bitStrategies) fallback.add(s.type());
         return fallback;
     }
 
     // ==================== 内部方法 ====================
 
     /**
-     * 整数置乱函数（用于隐藏嵌入位置）。
+     * 整数置乱函数（用于生成位置种子）。
      */
     private int scramble(int input, String secret) {
         long h = input * 31L + secret.hashCode();
@@ -568,6 +613,47 @@ public class Watermarker {
         h = (h ^ (h >>> 16)) * 0x45D9F3BL;
         h = h ^ (h >>> 16);
         return (int) Math.floorMod(h, Integer.MAX_VALUE);
+    }
+
+    /**
+     * 计算单元格值的位置种子（bit-level 策略使用）。
+     * <p>
+     * 由密钥 + 行列坐标混合而成。嵌入与提取必须以相同方式计算，
+     * 只要数据集的行序与列序保持稳定，同一单元格总能得到同一 seed。
+     * </p>
+     */
+    private long cellSeed(int row, int col) {
+        return ((long) scramble(row, config.getSecret()) << 32)
+                | (scramble(col, config.getSecret()) & 0xFFFFFFFFL);
+    }
+
+    /**
+     * 计算行的位置种子（simple 策略使用）。
+     */
+    private long rowSeed(int row) {
+        return scramble(row, config.getSecret());
+    }
+
+    /**
+     * 由密钥派生确定性 0/1 密钥流。
+     * <p>
+     * bit-level 载荷在嵌入前与密钥流异或，提取时对称还原，
+     * 使"不知道密钥就无法读出载荷"（错误密钥 → CRC32 校验失败）。
+     * 注意：长度头部（8 bit）不做置乱，错误密钥下表现为载荷区 CRC 不匹配。
+     * </p>
+     */
+    private int[] keyStream(int length) {
+        long seed = 1125899906842597L;
+        String secret = config.getSecret();
+        for (int i = 0; i < secret.length(); i++) {
+            seed = 31 * seed + secret.charAt(i);
+        }
+        java.util.Random rnd = new java.util.Random(seed);
+        int[] ks = new int[length];
+        for (int i = 0; i < length; i++) {
+            ks[i] = rnd.nextInt(2);
+        }
+        return ks;
     }
 
     /**
@@ -593,10 +679,10 @@ public class Watermarker {
      * 根据值查找匹配的 bit-level 策略。
      * types 为 null 时使用所有已注册的 bit-level 策略。
      */
-    private ColumnWatermarkStrategy findBitStrategy(Object value, List<WatermarkType> types) {
-        for (int i = 0; i < bitStrategies.size(); i++) {
-            if (types != null && !types.contains(bitLevelType(i))) continue;
-            if (bitStrategies.get(i).canWatermark(value)) return bitStrategies.get(i);
+    private BitCarrierStrategy findBitStrategy(Object value, List<WatermarkType> types) {
+        for (BitCarrierStrategy s : bitStrategies) {
+            if (types != null && !types.contains(s.type())) continue;
+            if (s.canWatermark(value)) return s;
         }
         return null;
     }
@@ -604,8 +690,8 @@ public class Watermarker {
     /**
      * 查找任意匹配的 bit-level 策略（提取时使用）。
      */
-    private ColumnWatermarkStrategy findAnyBitStrategy(Object value) {
-        for (ColumnWatermarkStrategy s : bitStrategies)
+    private BitCarrierStrategy findAnyBitStrategy(Object value) {
+        for (BitCarrierStrategy s : bitStrategies)
             if (s.canWatermark(value)) return s;
         return null;
     }
@@ -614,9 +700,9 @@ public class Watermarker {
      * 根据值查找匹配的 simple 策略。
      */
     private SimpleWatermarkStrategy findSimpleStrategy(Object value, List<WatermarkType> types) {
-        for (int i = 0; i < simpleStrategies.size(); i++) {
-            if (types != null && !types.contains(simpleType(i))) continue;
-            if (simpleStrategies.get(i).canWatermark(value)) return simpleStrategies.get(i);
+        for (SimpleWatermarkStrategy s : simpleStrategies) {
+            if (types != null && !types.contains(s.type())) continue;
+            if (s.canWatermark(value)) return s;
         }
         return null;
     }
@@ -635,9 +721,9 @@ public class Watermarker {
      */
     private WatermarkType detectBitWatermarkType(List<CellRef> cells) {
         for (CellRef cell : cells) {
-            for (int i = 0; i < bitStrategies.size(); i++) {
-                if (bitStrategies.get(i).canWatermark(cell.value)) {
-                    return bitLevelType(i);
+            for (BitCarrierStrategy s : bitStrategies) {
+                if (s.canWatermark(cell.value)) {
+                    return s.type();
                 }
             }
         }
@@ -652,33 +738,14 @@ public class Watermarker {
             for (String col : columns) {
                 Object value = row.get(col);
                 if (value == null) continue;
-                for (int i = 0; i < simpleStrategies.size(); i++) {
-                    if (simpleStrategies.get(i).canWatermark(value)) {
-                        return simpleType(i);
+                for (SimpleWatermarkStrategy s : simpleStrategies) {
+                    if (s.canWatermark(value)) {
+                        return s.type();
                     }
                 }
             }
         }
         return WatermarkType.SIMPLE_SUFFIX_MARKER;
-    }
-
-    /** 将 bit-level 策略索引映射为 WatermarkType */
-    private WatermarkType bitLevelType(int index) {
-        switch (index) {
-            case 0: return WatermarkType.BIT_CHINESE_ZERO_WIDTH;
-            case 1: return WatermarkType.BIT_LATIN_HOMOGLYPH;
-            case 2: return WatermarkType.BIT_NUMERIC_LSB;
-            default: return WatermarkType.BIT_CHINESE_ZERO_WIDTH;
-        }
-    }
-
-    /** 将 simple 策略索引映射为 WatermarkType */
-    private WatermarkType simpleType(int index) {
-        switch (index) {
-            case 0: return WatermarkType.SIMPLE_SUFFIX_MARKER;
-            case 1: return WatermarkType.SIMPLE_INVISIBLE_PADDING;
-            default: return WatermarkType.SIMPLE_SUFFIX_MARKER;
-        }
     }
 
     // ---------- 载荷编码/解码 ----------
@@ -692,7 +759,7 @@ public class Watermarker {
     private byte[] encodePayload(String payload) {
         byte[] data = payload.getBytes(StandardCharsets.UTF_8);
         int len = data.length;
-        if (len > 251) throw new IllegalArgumentException("载荷过长: " + len + " 字节，最大 251");
+        if (len > MAX_PAYLOAD_BYTES) throw new IllegalArgumentException("载荷过长: " + len + " 字节，最大 " + MAX_PAYLOAD_BYTES);
         byte[] result = new byte[len + 5];
         result[0] = (byte) len;
         System.arraycopy(data, 0, result, 1, len);

@@ -1,5 +1,7 @@
 package io.github.nameof.watermark.core.simple;
 
+import io.github.nameof.watermark.core.WatermarkType;
+
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -39,8 +41,8 @@ public class InvisiblePaddingStrategy implements SimpleWatermarkStrategy {
     private static final char ZWJ = '\u200D';
 
     @Override
-    public String name() {
-        return "invisible-padding";
+    public WatermarkType type() {
+        return WatermarkType.SIMPLE_INVISIBLE_PADDING;
     }
 
     @Override
@@ -55,7 +57,7 @@ public class InvisiblePaddingStrategy implements SimpleWatermarkStrategy {
     }
 
     @Override
-    public String embed(Object value, String payload, String secret, int rowIndex) {
+    public String embed(Object value, String payload, String secret, long seed) {
         String str = value.toString();
         // 先清除已有零宽字符，避免多次嵌入叠加
         str = removeZeroWidthChars(str);
@@ -76,7 +78,7 @@ public class InvisiblePaddingStrategy implements SimpleWatermarkStrategy {
     }
 
     @Override
-    public String extract(Object value, String secret, int rowIndex) {
+    public String extract(Object value, String secret, long seed) {
         if (value == null) {
             return null;
         }

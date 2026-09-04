@@ -7,7 +7,10 @@ public class WatermarkConfig {
 
     /**
      * 密钥，用于确定性地选择嵌入位置和编码水印。
-     * 嵌入和提取必须使用相同的密钥。
+     * <p>
+     * bit-level 模式：密钥同时决定嵌入位置与载荷置乱密钥流，嵌入和提取必须使用相同的密钥；
+     * simple 模式：密钥仅决定嵌入位置，提取不依赖密钥（SuffixMarker 为可见标记，设计上不保密）。
+     * </p>
      */
     private final String secret;
 
