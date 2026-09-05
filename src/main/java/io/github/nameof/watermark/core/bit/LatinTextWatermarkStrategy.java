@@ -62,10 +62,11 @@ public class LatinTextWatermarkStrategy implements BitCarrierStrategy {
 
     @Override
     public boolean canWatermark(Object value) {
-        if (value == null) {
+        // 仅支持字符串类型的文本值：数值等对象被 toString 后替换同形字会破坏数据类型完整性
+        if (!(value instanceof String)) {
             return false;
         }
-        String str = value.toString();
+        String str = (String) value;
         if (str.length() < MIN_LENGTH) {
             return false;
         }
@@ -80,7 +81,11 @@ public class LatinTextWatermarkStrategy implements BitCarrierStrategy {
 
     @Override
     public BitEmbedResult embed(Object value, int bit, String secret, long seed) {
-        String str = value.toString();
+        // 前置校验：避免调用方绕过 canWatermark 直接嵌入导致数据被破坏
+        if (!canWatermark(value)) {
+            return new BitEmbedResult(value, false);
+        }
+        String str = (String) value;
 
         // 收集所有可替换字符的位置
         int[] replaceablePositions = new int[str.length()];

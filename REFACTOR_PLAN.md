@@ -9,8 +9,8 @@ io.github.nameof.watermark
 │   ├── WatermarkConfig.java       # 配置（secret + minRepetition）
 │   ├── WatermarkResult.java       # 操作结果（从根包迁入，精简）
 │   ├── WatermarkType.java         # 水印类型枚举（内置 Mode 属性）
-│   ├── bit/                       # bit-level 策略（仅改包名）
-│   └── simple/                    # simple 策略（仅改包名）
+│   ├── bit/                       # bit 载体策略（BitCarrierStrategy 接口 + 3 实现）
+│   └── simple/                    # simple 策略（SimpleWatermarkStrategy 接口 + 2 实现）
 ├── database/                      # 数据库层：表级水印，开箱即用
 │   ├── DatabaseWatermarker.java   # 数据库表级 API 门面
 │   ├── ColumnDefinition.java      # 列定义 DTO（由用户提供）
@@ -66,8 +66,49 @@ Core 层只接收内存中的 `List<Map<String, Object>>` 数据集。约定：�
 ### 其他迁移
 - `WatermarkConfig` → `core/`，移除 `useBitLevel` 开关，保留 secret 和 minRepetition，新增 `chunkSize`（切片行数，默认 2000，供 Database 层使用）
 - `WatermarkResult` → `core/`，新增 `watermarkType` 字段，移除 `getReportImage()`（报告归 database 层）
-- `bit/*`、`simple/*` 仅改包名迁入 `core/`，逻辑不变
 - 删除根包下旧文件：`DataWatermarker`、`SimpleWatermarker`、`WatermarkEngine`、`WatermarkReportGenerator`
+
+## 策略接口修订（core 层重构后的架构修正）
+
+> 本节为 core 层迁移完成后的接口修订记录。原计划"bit/*、simple/* 仅改包名迁入 core/，逻辑不变"，
+> 实施 review 后发现接口签名把表格坐标（row/col）泄漏进了策略层，导致 core 层绑死表格结构，已修正。
+
+### 分层定位
+
+- **载体层（策略接口）**：单值粒度，只负责"如何在一个值里隐蔽藏信息"（1 bit 或完整载荷）。
+  单值嵌 1 bit 是刻意设计（隐蔽性权衡：一个值塞多个零宽字符会显著增加统计检测风险）。
+- **编码/扩频层（Watermarker）**：多值粒度，负责载荷 → bit 流 → 冗余分布（两段式头部、
+  交叉分配、多数投票、CRC32）。一次完整水印的嵌入天然需要多个值，此职责不在策略接口内。
+
+### 接口变更
+
+| 原接口 | 新接口 | 变更 |
+|---|---|---|
+| `ColumnWatermarkStrategy` | `BitCarrierStrategy` | 改名（"Column" 有误导性，实为单值接口）；签名 `embed(value, bit, secret, int row, int col)` → `embed(value, bit, secret, long seed)`；新增 `type()` |
+| `ColumnEmbedResult` | `BitEmbedResult` | 改名，内容不变 |
+| `SimpleWatermarkStrategy` | （保留名称） | 签名 `embed(value, payload, secret, int rowIndex)` → `embed(value, payload, secret, long seed)`；`name()` → `type()` |
+
+`seed` 由 `Watermarker` 从值的稳定标识计算（`cellSeed(row, col)` / `rowSeed(row)`，密钥参与置乱），
+策略不感知其来源 —— 未来支持非表格数据集（文档、JSON 等）时可直接复用全部策略。
+`type()` 返回策略对应的 `WatermarkType`，消除 Watermarker 中按注册顺序的索引映射。
+
+安全性说明：5 个策略的 `extract` 实现均为扫描式提取（不依赖坐标），seed 仅影响嵌入位置
+（防统一截断攻击），因此本变更不影响 embed→extract 往返正确性（测试已回归验证）。
+
+### 接口修订后补测试时发现并修复的缺陷（2026-09-03）
+
+为 seed 化接口补充单元测试（策略契约测试 + 引擎端到端测试，共 39 个新增用例，63/63 全绿）时，
+暴露了 3 个此前因缺少直接策略测试而一直未发现的缺陷，均已修复：
+
+1. **LatinTextWatermarkStrategy.embed 忽略 bit 参数**：无论嵌入 0 还是 1 都替换为同形字，
+   而 extract 把"有同形字"读作 1 —— 即嵌入 bit 0 后提取得到 1。
+   修复：bit 1 = 替换选定字符为同形字；bit 0 = 归一化（还原已有同形字为 ASCII，保证无同形字）。
+2. **策略分发顺序错误**：ChineseText 的 `canWatermark` 对任意 ≥2 字符的值都返回 true 且注册在首位，
+   `findBitStrategy`/`findAnyBitStrategy` 永远先命中它 —— Latin/Numeric 在引擎中是死代码
+   （数值列实际被插入零宽字符而非末位微扰）。修复：注册顺序改为**最具体优先**
+   （Numeric → Latin → Chinese），嵌入与提取共用此顺序；自定义策略构造器 javadoc 已注明该约定。
+3. **NumericWatermarkStrategy 的 locale 依赖**：`String.format` 未指定 `Locale.ROOT`，
+   在小数点为逗号的 locale 下会产出 `"123,45"`。修复：显式指定 `Locale.ROOT`。
 
 ## 数据库层 (database)
 

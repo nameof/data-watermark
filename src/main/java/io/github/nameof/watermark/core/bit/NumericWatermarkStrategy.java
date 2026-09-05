@@ -53,6 +53,10 @@ public class NumericWatermarkStrategy implements BitCarrierStrategy {
 
     @Override
     public BitEmbedResult embed(Object value, int bit, String secret, long seed) {
+        // 前置校验：避免调用方绕过 canWatermark 直接嵌入，导致 toDouble/parseDouble 抛异常
+        if (!canWatermark(value)) {
+            return new BitEmbedResult(value, false);
+        }
         double num = toDouble(value);
         int precision = getPrecision(value);
 

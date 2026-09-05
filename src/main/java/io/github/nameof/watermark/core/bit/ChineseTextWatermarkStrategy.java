@@ -39,10 +39,11 @@ public class ChineseTextWatermarkStrategy implements BitCarrierStrategy {
 
     @Override
     public boolean canWatermark(Object value) {
-        if (value == null) {
+        // 仅支持字符串类型的文本值：数值等对象被 toString 后插入零宽字符会破坏数据类型完整性
+        if (!(value instanceof String)) {
             return false;
         }
-        String str = value.toString();
+        String str = (String) value;
         // 去除已有的零宽字符后检查有效长度
         String cleaned = removeZeroWidthChars(str);
         return cleaned.length() >= MIN_LENGTH;
@@ -50,13 +51,13 @@ public class ChineseTextWatermarkStrategy implements BitCarrierStrategy {
 
     @Override
     public BitEmbedResult embed(Object value, int bit, String secret, long seed) {
-        String str = value.toString();
-        // 先清除已有零宽字符，避免多次嵌入叠加
-        String cleaned = removeZeroWidthChars(str);
-
-        if (cleaned.length() < MIN_LENGTH) {
+        // 前置校验：避免调用方绕过 canWatermark 直接嵌入导致数据被破坏
+        if (!canWatermark(value)) {
             return new BitEmbedResult(value, false);
         }
+        String str = (String) value;
+        // 先清除已有零宽字符，避免多次嵌入叠加
+        String cleaned = removeZeroWidthChars(str);
 
         // 用密钥 + 种子确定插入位置，使不同值在不同位置嵌入（增加攻击者定位难度）
         int pos = Math.abs(hashPosition(secret, seed)) % cleaned.length();

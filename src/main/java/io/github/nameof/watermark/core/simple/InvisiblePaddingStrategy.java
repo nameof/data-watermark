@@ -47,10 +47,12 @@ public class InvisiblePaddingStrategy implements SimpleWatermarkStrategy {
 
     @Override
     public boolean canWatermark(Object value) {
-        if (value == null) {
+        // 仅支持字符串类型的文本值：数值等对象若被 toString 后追加零宽字符，
+        // 会破坏原始数据类型（数字不再是数字），因此必须在类型层拦截。
+        if (!(value instanceof String)) {
             return false;
         }
-        String str = value.toString();
+        String str = (String) value;
         // 去除已有零宽字符后检查是否有实际内容
         String cleaned = removeZeroWidthChars(str);
         return !cleaned.trim().isEmpty();
@@ -58,7 +60,11 @@ public class InvisiblePaddingStrategy implements SimpleWatermarkStrategy {
 
     @Override
     public String embed(Object value, String payload, String secret, long seed) {
-        String str = value.toString();
+        // 前置校验：避免调用方绕过 canWatermark 直接嵌入导致数据被破坏
+        if (!canWatermark(value)) {
+            throw new IllegalArgumentException("值不支持零宽填充水印，仅支持非空文本: " + type());
+        }
+        String str = (String) value;
         // 先清除已有零宽字符，避免多次嵌入叠加
         str = removeZeroWidthChars(str);
 

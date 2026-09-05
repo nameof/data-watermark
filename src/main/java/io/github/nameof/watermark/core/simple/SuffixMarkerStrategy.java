@@ -41,16 +41,21 @@ public class SuffixMarkerStrategy implements SimpleWatermarkStrategy {
 
     @Override
     public boolean canWatermark(Object value) {
-        if (value == null) {
+        // 仅支持字符串类型的文本值：数值等对象被 toString 后插入标记会破坏数据类型完整性
+        if (!(value instanceof String)) {
             return false;
         }
-        String str = value.toString().trim();
+        String str = ((String) value).trim();
         return !str.isEmpty();
     }
 
     @Override
     public String embed(Object value, String payload, String secret, long seed) {
-        String str = value.toString();
+        // 前置校验：避免调用方绕过 canWatermark 直接嵌入导致数据被破坏
+        if (!canWatermark(value)) {
+            throw new IllegalArgumentException("值不支持后缀标记水印，仅支持非空文本: " + type());
+        }
+        String str = (String) value;
         // 先清除已有的标记，避免多次嵌入叠加
         str = removeMarker(str);
 

@@ -4,7 +4,7 @@
 
 ## 特性
 
-- **两种水印模式**
+- **统一核心 API（core 层）**：`Watermarker` 一个入口同时支持两种水印模式
   - **Bit-level**（默认）：两段式编码 + 交叉分配 + CRC32 校验，高隐蔽、高健壮性，容忍高达 60% 的数据删除
   - **Simple**：每个单元格独立承载完整载荷，实现简单，适合内部数据追溯
 - **三种 Bit-level 嵌入策略**（自动按数据类型选择）
@@ -14,9 +14,10 @@
 - **两种 Simple 嵌入策略**
   - 后缀标记 → 可见标记 `[::payload::]`，最简单直观
   - 隐形填充 → 零宽字符编码完整载荷，肉眼不可见
-- **多种数据源**：MySQL 数据库、CSV 文件、内存数据
-- **可视化提取报告**：Java 2D 生成报告图片，用于追责证据展示
-- **Java 8** 兼容，无第三方运行时依赖（MySQL JDBC 除外）
+- **数据源抽象（io 层）**：`DataSource` 接口 + CSV 实现，可与 `Watermarker` 自由组合
+- **Java 8** 兼容，无第三方运行时依赖
+
+> 🚧 **开发中**：数据库表级一键集成（`DatabaseWatermarker`，含大数据切片、多表提取报告、报告图片生成）。
 
 ## Maven 依赖
 
@@ -27,6 +28,58 @@
     <version>1.0.0-SNAPSHOT</version>
 </dependency>
 ```
+
+## 架构概览
+
+```
+io.github.nameof.watermark/
+├── core/                              # 核心层（与存储无关）
+│   ├── Watermarker.java               # 统一核心 API（canWatermark/embed/extract）
+│   ├── WatermarkConfig.java           # 配置（secret + minRepetition + chunkSize）
+│   ├── WatermarkResult.java           # 操作结果
+│   ├── WatermarkType.java             # 水印类型枚举（内置 Mode 属性）
+│   │
+│   ├── bit/                           # bit 载体策略（每个值承载 1 bit）
+│   │   ├── BitCarrierStrategy.java    # 策略接口（单值 + seed）
+│   │   ├── BitEmbedResult.java        # 单值嵌入结果
+│   │   ├── ChineseTextWatermarkStrategy.java  # 中文 → 零宽字符
+│   │   ├── LatinTextWatermarkStrategy.java    # 拉丁文 → 同形字替换
+│   │   └── NumericWatermarkStrategy.java      # 数值 → 末位微扰
+│   │
+│   └── simple/                        # simple 策略（每个值承载完整载荷）
+│       ├── SimpleWatermarkStrategy.java  # 策略接口（单值 + seed）
+│       ├── SuffixMarkerStrategy.java     # 后缀标记（可见）
+│       └── InvisiblePaddingStrategy.java # 隐形填充（零宽字符）
+│
+└── io/                                # 数据源抽象
+    ├── DataSource.java                # 数据源接口
+    ├── TableData.java                 # 表数据 DTO
+    ├── JdbcDataSource.java            # JDBC 实现
+    └── CsvDataSource.java             # CSV 实现
+```
+
+### 分层设计
+
+| 层 | 位置 | 职责 | 粒度 |
+|----|------|------|------|
+| 载体层（策略） | `core.bit` / `core.simple` | 在**单个值**中隐蔽地嵌入/提取 1 bit 或完整载荷 | 单值 |
+| 编码/扩频层 | `core.Watermarker` | 载荷 → bit 流 → 冗余分布到多个值（两段式头部、交叉分配、多数投票、CRC32） | 多值/数据集 |
+| 数据源层 | `io` | 表数据的读取与写回（CSV/JDBC） | 表 |
+
+> 一次完整水印的嵌入天然需要多个值：bit-level 模式下每个单元格只承载 1 bit，
+> 由 `Watermarker` 负责把载荷编码为 bit 流并冗余分布到整个数据集。
+> 策略接口通过 `seed`（由引擎从值的稳定标识计算）选择嵌入位置，
+> 不感知数据集形态 —— 这使得策略可以被未来的非表格数据集（文档、JSON 等）直接复用。
+
+## 水印策略对照表
+
+| 原始数据 | 水印策略 | Java 类 | WatermarkType 枚举 | 水印后数据示例 | 原理说明 |
+|---|---|---|---|---|---|
+| `"张三"` (中文文本) | 中文零宽字符 | `ChineseTextWatermarkStrategy` | `BIT_CHINESE_ZERO_WIDTH` | `"张\u200B三"` 或 `"张\u200C三"` | 在文字间插入零宽字符，U+200B=bit0, U+200C=bit1，每个单元格只编码 1 bit |
+| `"John"` (拉丁文本) | 拉丁同形字替换 | `LatinTextWatermarkStrategy` | `BIT_LATIN_HOMOGLYPH` | `"Jоhn"` (о是西里尔字母) | 把某个 ASCII 字母替换为视觉相同的西里尔字母，替换=bit1，原样=bit0 |
+| `123.45` (数值) | 数值末位微扰 | `NumericWatermarkStrategy` | `BIT_NUMERIC_LSB` | `123.44` 或 `123.46` | 末位调为偶数=bit0，奇数=bit1，差异不超过 1 个最小精度单位 |
+| `"张三"` (任意文本) | 后缀标记 | `SuffixMarkerStrategy` | `SIMPLE_SUFFIX_MARKER` | `"张[::operator:zs::]三"` | 在随机位置插入 `[::payload::]` 可见标记，每个单元格携带完整载荷 |
+| `"张三"` (任意文本) | 零宽填充 | `InvisiblePaddingStrategy` | `SIMPLE_INVISIBLE_PADDING` | `"张三\u200B\u200C\u200B..."` | 把完整载荷编码为零宽字符序列追加到末尾，每个单元格携带完整载荷 |
 
 ## 前置条件（重要）
 
@@ -76,12 +129,12 @@
 
 ## Quick Start
 
-### 1. 内存数据嵌入/提取（Bit-level 模式）
+### 1. 内存数据嵌入/提取（自动选择策略，默认 Bit-level）
 
 最基础的用法：直接在内存数据上嵌入和提取水印。
 
 ```java
-import io.github.nameof.watermark.*;
+import io.github.nameof.watermark.core.*;
 import java.util.*;
 
 // 准备数据（需满足数据类型要求）
@@ -94,21 +147,21 @@ for (int i = 0; i < 500; i++) {
     table.add(row);
 }
 
-// 配置
+// 配置与核心 API
 WatermarkConfig config = new WatermarkConfig("my-secret-key");
-
-// 嵌入水印
-DataWatermarker watermarker = new DataWatermarker(config);
+Watermarker watermarker = new Watermarker(config);
 List<String> columns = Arrays.asList("name", "address", "salary");
 String payload = "operator:zhangsan|company:ACME|time:2024-01-01";
 
+// 嵌入水印（strategies 传 null 时自动选择：bit-level 优先，容量不足降级 simple）
 WatermarkResult<List<Map<String, Object>>> embedResult =
         watermarker.embed(table, columns, payload);
 
 if (embedResult.isSuccess()) {
     System.out.println("嵌入成功，重复因子: " + embedResult.getRepetition());
+    System.out.println("使用的水印类型: " + embedResult.getWatermarkType());
 
-    // 提取水印
+    // 提取水印（自动尝试 bit-level 和 simple 两种模式，返回最可靠结果）
     WatermarkResult<String> extractResult =
             watermarker.extract(embedResult.getData(), columns);
     System.out.println("还原载荷: " + extractResult.getData());
@@ -118,13 +171,12 @@ if (embedResult.isSuccess()) {
 
 > **注意**：Bit-level 模式需要足够的可嵌入单元格。对于 30 字节的载荷，至少需要约 1500 个可嵌入单元格（约 500 行 × 3 列）。
 
-### 2. 简单模式（Simple）
+### 2. 指定 Simple 模式
 
 适合内部数据追溯，实现简单，对数据量要求低（几行即可）。
 
 ```java
-import io.github.nameof.watermark.*;
-import io.github.nameof.watermark.simple.*;
+import io.github.nameof.watermark.core.*;
 import java.util.*;
 
 // 准备数据（少量数据即可）
@@ -136,214 +188,114 @@ for (int i = 0; i < 10; i++) {
     table.add(row);
 }
 
-// 使用简单模式
-WatermarkConfig config = new WatermarkConfig("my-secret").setUseBitLevel(false);
-SimpleWatermarker watermarker = new SimpleWatermarker(config);
+WatermarkConfig config = new WatermarkConfig("my-secret");
+Watermarker watermarker = new Watermarker(config);
 List<String> columns = Arrays.asList("name", "description");
+
+// 显式指定 simple 策略（也可只选其中一种）
+List<WatermarkType> strategies = Arrays.asList(
+        WatermarkType.SIMPLE_SUFFIX_MARKER,      // 后缀标记（可见）
+        WatermarkType.SIMPLE_INVISIBLE_PADDING); // 隐形填充（不可见）
 
 // 嵌入
 WatermarkResult<List<Map<String, Object>>> embedResult =
-        watermarker.embed(table, columns, "operator:zhangsan");
+        watermarker.embed(table, columns, "operator:zhangsan", strategies);
 
-// 提取（多数投票）
+// 提取（每单元格独立提取 + 多数投票）
 WatermarkResult<String> extractResult =
         watermarker.extract(embedResult.getData(), columns);
 System.out.println("载荷: " + extractResult.getData());
 ```
 
-### 3. MySQL 数据库集成
+### 3. 检测数据支持哪些水印类型
 
-从数据库读取 → 嵌入水印 → 写入新表 → 提取验证。
+嵌入前可先扫描数据，查看支持的水印类型。
 
 ```java
-import io.github.nameof.watermark.*;
+import io.github.nameof.watermark.core.*;
 import java.util.*;
 
-WatermarkConfig config = new WatermarkConfig("my-secret-key");
-
-try (WatermarkEngine engine = new WatermarkEngine(
-        "jdbc:mysql://localhost:3306/mydb?useSSL=false&characterEncoding=UTF-8",
-        "root", "root", config)) {
-
-    List<String> columns = Arrays.asList("name", "address", "salary");
-
-    // 嵌入水印到新表
-    WatermarkResult<TableData> embedResult = engine.embed(
-            "citizen_info", columns,
-            "operator:zhangsan|batch:20240101",
-            "citizen_info_watermarked");
-
-    if (embedResult.isSuccess()) {
-        System.out.println("水印已写入新表 citizen_info_watermarked");
-    }
-
-    // 从新表提取水印
-    WatermarkResult<String> extractResult = engine.extract(
-            "citizen_info_watermarked", columns);
-    System.out.println("还原载荷: " + extractResult.getData());
-}
+Watermarker watermarker = new Watermarker(new WatermarkConfig("my-secret-key"));
+Set<WatermarkType> types = watermarker.canWatermark(table, columns);
+// 例如: [BIT_CHINESE_ZERO_WIDTH, BIT_NUMERIC_LSB, SIMPLE_SUFFIX_MARKER, ...]
 ```
 
-### 4. CSV 文件导出
+### 4. 单独使用策略（无需 Watermarker）
 
-从数据库读取 → 嵌入水印 → 导出为 CSV 文件。
+策略是纯单值变换，可以直接使用。bit 策略在单个值中嵌 1 bit，`seed` 决定嵌入在值的哪个位置（相同 seed + 密钥 → 相同位置）。
 
 ```java
-import io.github.nameof.watermark.*;
-import java.util.*;
+import io.github.nameof.watermark.core.bit.*;
 
-WatermarkConfig config = new WatermarkConfig("my-secret-key");
-
-try (WatermarkEngine engine = new WatermarkEngine(
-        "jdbc:mysql://localhost:3306/mydb?useSSL=false&characterEncoding=UTF-8",
-        "root", "root", config)) {
-
-    List<String> columns = Arrays.asList("name", "address", "salary");
-
-    // 嵌入水印并导出到 CSV
-    engine.embedToCsv("citizen_info", columns,
-            "operator:zhangsan", "/tmp/watermarked_output.csv");
-
-    // 从 CSV 提取水印
-    WatermarkResult<String> result = engine.extractFromCsv(
-            "/tmp/watermarked_output.csv", columns);
-    System.out.println("载荷: " + result.getData());
+// bit 载体策略：单值嵌 1 bit
+ChineseTextWatermarkStrategy strategy = new ChineseTextWatermarkStrategy();
+BitEmbedResult result = strategy.embed("张三", 1, "secret", 42L);
+if (result.isEmbedded()) {
+    String embedded = (String) result.getValue();
+    // → "张\u200C三"（看起来还是"张三"）
+    int bit = strategy.extract(embedded, "secret", 42L);
+    // → 1
 }
+
+// simple 策略：单值嵌完整载荷
+import io.github.nameof.watermark.core.simple.*;
+
+SuffixMarkerStrategy suffix = new SuffixMarkerStrategy();
+String embedded = suffix.embed("张三", "operator:zhangsan", "secret", 0L);
+// → "张[::operator:zhangsan::]三"
+String payload = suffix.extract(embedded, "secret", 0L);
+// → "operator:zhangsan"
 ```
 
-### 5. 纯 CSV 数据源
+> 单独使用 bit 策略时没有冗余保护：值被修改（如零宽字符被清洗）该 bit 即丢失。
+> 完整载荷的嵌入请使用 `Watermarker`，由它负责冗余分配和多数投票。
 
-不依赖数据库，直接操作 CSV 文件。
+### 5. CSV 数据源组合
+
+通过 `io` 层的 `DataSource` 读取表数据，用 `Watermarker` 嵌入后写回。
 
 ```java
-import io.github.nameof.watermark.*;
+import io.github.nameof.watermark.core.*;
 import io.github.nameof.watermark.io.*;
 import java.util.*;
 
-WatermarkConfig config = new WatermarkConfig("my-secret-key");
-CsvDataSource csvSource = new CsvDataSource("/data/csv");
-
-try (WatermarkEngine engine = new WatermarkEngine(csvSource, config)) {
+try (CsvDataSource csvSource = new CsvDataSource("/data/csv")) {
+    // 读取 CSV
+    TableData tableData = csvSource.readTable("source_data");
     List<String> columns = Arrays.asList("name", "address");
 
-    // 读取 CSV → 嵌入水印 → 写入新 CSV
-    engine.embedToCsv("source_data", columns,
-            "operator:zhangsan", "/data/csv/output.csv");
+    // 嵌入水印
+    Watermarker watermarker = new Watermarker(new WatermarkConfig("my-secret-key"));
+    WatermarkResult<List<Map<String, Object>>> embedResult =
+            watermarker.embed(tableData.getRows(), columns, "operator:zhangsan");
+    if (!embedResult.isSuccess()) {
+        throw new IllegalStateException("嵌入失败: " + embedResult.getMessage());
+    }
 
-    // 从新 CSV 提取
-    WatermarkResult<String> result = engine.extractFromCsv(
-            "/data/csv/output.csv", columns);
+    // 写回新 CSV
+    TableData watermarked = new TableData(
+            "source_data_watermarked", tableData.getColumnNames(), embedResult.getData());
+    csvSource.writeTable(watermarked, "source_data_watermarked");
+
+    // 从新 CSV 提取验证
+    TableData verification = csvSource.readTable("source_data_watermarked");
+    WatermarkResult<String> result =
+            watermarker.extract(verification.getRows(), columns);
     System.out.println("载荷: " + result.getData());
 }
 ```
 
-### 6. 使用自定义数据源（JDBC Connection）
-
-当你已有数据库连接时，可以直接传入 Connection。
-
-```java
-import io.github.nameof.watermark.*;
-import io.github.nameof.watermark.io.*;
-import java.sql.*;
-import java.util.*;
-
-Connection conn = DriverManager.getConnection(jdbcUrl, user, password);
-JdbcDataSource ds = new JdbcDataSource(conn); // 不自动关闭连接
-
-WatermarkConfig config = new WatermarkConfig("my-secret-key");
-try (WatermarkEngine engine = new WatermarkEngine(ds, config)) {
-    engine.embed("users", Arrays.asList("name", "email"),
-            "operator:zhangsan", "users_watermarked");
-}
-// conn 不会被关闭，需自行管理
-```
-
-### 7. 单独使用简单策略
-
-直接使用策略类，无需引擎。
-
-```java
-import io.github.nameof.watermark.simple.*;
-
-// 后缀标记策略（肉眼可见）
-SuffixMarkerStrategy suffix = new SuffixMarkerStrategy();
-String embedded = suffix.embed("张三", "operator:zhangsan", "secret");
-// → "张三 [::operator:zhangsan::]"
-String payload = suffix.extract(embedded, "secret");
-// → "operator:zhangsan"
-
-// 隐形填充策略（肉眼不可见）
-InvisiblePaddingStrategy invisible = new InvisiblePaddingStrategy();
-String hidden = invisible.embed("张三", "operator:zhangsan", "secret");
-// → "张三" + 零宽字符序列（看起来还是"张三"，但 length() 显著增加）
-String extracted = invisible.extract(hidden, "secret");
-// → "operator:zhangsan"
-```
-
-### 8. 生成提取报告图片
-
-提取水印后，生成可视化的报告图片用于追责证据展示。
-
-```java
-import io.github.nameof.watermark.*;
-import javax.imageio.ImageIO;
-import java.awt.image.BufferedImage;
-import java.io.File;
-
-// 提取水印
-WatermarkResult<String> result = watermarker.extract(table, columns);
-
-if (result.isSuccess()) {
-    System.out.println("载荷: " + result.getData());
-
-    // 生成报告图片
-    BufferedImage reportImage = result.getReportImage();
-    ImageIO.write(reportImage, "png", new File("watermark_report.png"));
-    System.out.println("报告图片已生成");
-}
-```
-
-报告图片包含：提取时间、水印模式、重复因子、CRC32 校验状态、还原载荷、提取统计（总单元格、有效提取数、投票置信度）、涉及列名。
-
-## 架构概览
-
-```
-io.github.nameof.watermark/
-├── WatermarkEngine.java              # 高层门面 API（推荐入口）
-├── WatermarkConfig.java              # 配置（密钥、模式切换）
-├── WatermarkResult.java              # 统一结果封装 + 报告图片生成
-├── WatermarkReportGenerator.java     # Java 2D 报告图片生成器
-├── DataWatermarker.java              # Bit-level 核心引擎
-│
-├── bit/                              # Bit-level 策略（每个单元格嵌入 1 bit）
-│   ├── ColumnWatermarkStrategy.java  # 策略接口
-│   ├── ColumnEmbedResult.java        # 嵌入结果
-│   ├── ChineseTextWatermarkStrategy.java  # 中文 → 零宽字符
-│   ├── LatinTextWatermarkStrategy.java    # 拉丁文 → 同形字替换
-│   └── NumericWatermarkStrategy.java      # 数值 → 末位微扰
-│
-├── simple/                           # Simple 策略（每个单元格嵌入完整载荷）
-│   ├── SimpleWatermarkStrategy.java  # 策略接口
-│   ├── SimpleWatermarker.java        # 简单水印引擎
-│   ├── SuffixMarkerStrategy.java     # 后缀标记（可见）
-│   └── InvisiblePaddingStrategy.java # 隐形填充（零宽字符）
-│
-└── io/                               # 数据源抽象
-    ├── TableData.java                # 表数据 DTO
-    ├── DataSource.java               # 数据源接口
-    ├── JdbcDataSource.java           # JDBC 实现
-    └── CsvDataSource.java           # CSV 实现
-```
+JDBC 场景同理：构造 `JdbcDataSource`（传入 `Connection`），按相同的 readTable → embed → writeTable 流程组合。
 
 ## 两种模式对比
 
-| 特性 | Bit-level | Simple |
-|------|-----------|--------|
-| 隐蔽性 | 极高（零宽字符/同形字/末位±1） | 中（后缀可见 / 零宽字符） |
-| 健壮性 | 高（容忍 60% 数据删除） | 低（无冗余编码） |
-| 数据量要求 | 高（需数百行以上） | 低（几行即可） |
-| 实现复杂度 | 高（两段式编码+交叉分配+CRC32） | 低（每单元格独立） |
-| 适用场景 | 对外数据泄露追溯 | 内部数据标记/调试 |
+| | bit-level 模式 | simple 模式 |
+|---|---|---|
+| 每个单元格承载 | 1 bit | 完整载荷 |
+| 编码机制 | 两段式头部 + 载荷 + CRC32，交叉分配，多数投票 | 每个单元格独立，提取时多数投票 |
+| 容量需求 | 高（每字节载荷约需 20 个单元格） | 低（有足够非空单元格即可） |
+| 鲁棒性 | 高（冗余分布，容忍 50%+ 数据删除） | 中（依赖多数投票） |
+| 隐蔽性 | 高（肉眼完全不可见） | 后缀标记可见，零宽填充不可见 |
 
 ## Bit-level 容量与鲁棒性
 
@@ -399,15 +351,21 @@ R = (2400 - 24) / 288 ≈ 8
 ## 配置参数
 
 ```java
-// 基本配置
+// 基本配置（minRepetition=5, chunkSize=2000）
 WatermarkConfig config = new WatermarkConfig("your-secret-key");
 
-// 指定最小重复因子（默认 5，越大越健壮但载荷容量越小）
+// 指定最小重复因子（默认 5，越大越健壮但载荷容量越小，最小 3）
 WatermarkConfig config = new WatermarkConfig("your-secret-key", 8);
 
-// 切换到简单模式
-config.setUseBitLevel(false);
+// 指定切片行数（默认 2000，供 Database 层分批处理使用）
+WatermarkConfig config = new WatermarkConfig("your-secret-key", 5, 2000);
 ```
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| `secret` | 必填 | 密钥，决定嵌入位置，提取时必须一致 |
+| `minRepetition` | 5 | 每个 bit 的最小重复数，越大越健壮、容量越小 |
+| `chunkSize` | 2000 | 大数据切片行数（Database 层使用） |
 
 ## 数据库要求
 
