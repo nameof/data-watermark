@@ -191,7 +191,7 @@ public class CsvDataSource implements DataSource {
         for (int i = 0; i < fields.size(); i++) {
             if (i > 0) sb.append(',');
             String field = fields.get(i);
-            if (field.contains(",") || field.contains("\"") || field.contains("\n")) {
+            if (field.contains(",") || field.contains("\"") || field.contains("\n") || field.contains("\r")) {
                 sb.append('"').append(field.replace("\"", "\"\"")).append('"');
             } else {
                 sb.append(field);

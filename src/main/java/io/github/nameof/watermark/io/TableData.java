@@ -29,7 +29,9 @@ public class TableData {
      */
     public TableData(String tableName, List<String> columnNames, List<Map<String, Object>> rows) {
         this.tableName = tableName;
-        this.columnNames = Collections.unmodifiableList(new ArrayList<>(columnNames));
+        this.columnNames = columnNames != null
+                ? Collections.unmodifiableList(new ArrayList<>(columnNames))
+                : Collections.<String>emptyList();
         this.rows = rows != null ? new ArrayList<>(rows) : new ArrayList<Map<String, Object>>();
     }
 
@@ -41,8 +43,11 @@ public class TableData {
         return columnNames;
     }
 
+    /**
+     * 获取行数据列表（不可变视图，行内 Map 仍可修改）。
+     */
     public List<Map<String, Object>> getRows() {
-        return rows;
+        return Collections.unmodifiableList(rows);
     }
 
     /** 获取行数 */

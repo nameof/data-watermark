@@ -246,6 +246,121 @@ public class Watermarker {
         }
     }
 
+    // ==================== Values API（新增，ADR-0001 渐进式）====================
+
+    /**
+     * Values API 包装用虚拟列名（仅在内部把 List<?> 包装为 List<Map> 时使用，对外不可见）。
+     */
+    private static final String VALUES_API_VIRTUAL_COLUMN = "_value";
+    private static final List<String> VALUES_API_VIRTUAL_COLUMN_LIST =
+            Collections.singletonList(VALUES_API_VIRTUAL_COLUMN);
+
+    /**
+     * 扫描值序列，返回支持的所有水印类型（值序列 API）。
+     *
+     * @param values 值序列
+     * @return 支持的水印类型集合
+     */
+    public Set<WatermarkType> canWatermark(List<?> values) {
+        Set<WatermarkType> result = new LinkedHashSet<>();
+        if (values == null || values.isEmpty()) return result;
+        for (Object value : values) {
+            if (value == null) continue;
+            for (BitCarrierStrategy s : bitStrategies) {
+                if (s.canWatermark(value)) result.add(s.type());
+            }
+            for (SimpleWatermarkStrategy s : simpleStrategies) {
+                if (s.canWatermark(value)) result.add(s.type());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 嵌入水印（值序列 API，自动选择策略）。
+     * <p>
+     * 与 {@link #embed(List, List, String, List)}（Table API）的区别：
+     * 本方法接受任意类型的值序列，无需指定列名，更接近水印的数学抽象
+     * （有序、稳定、可微修改的值序列）。适合非表格场景
+     * （JSON 数组、文档字符序列、纯 {@code List<String>} 等）。
+     * </p>
+     * <p>
+     * <b>Seed 约定</b>：内部将值序列包装为单虚拟列的 table 后复用 Table API，
+     * seed 由值在序列中的索引生成（等价于 {@code cellSeed(i, 0)}）。
+     * 调用方必须保证嵌入与提取时传入的序列顺序一致。
+     * </p>
+     *
+     * @param values  值序列
+     * @param payload 水印载荷
+     * @return 嵌入结果
+     */
+    public WatermarkResult<List<Object>> embed(List<?> values, String payload) {
+        return embed(values, payload, null);
+    }
+
+    /**
+     * 嵌入水印（值序列 API，指定策略）。
+     *
+     * @param values     值序列
+     * @param payload    水印载荷
+     * @param strategies 水印类型列表，null 时自动选择（bit-level 优先，容量不足降级 simple）
+     * @return 嵌入结果
+     */
+    public WatermarkResult<List<Object>> embed(List<?> values, String payload,
+                                               List<WatermarkType> strategies) {
+        if (values == null || values.isEmpty())
+            return WatermarkResult.failure("值序列为空");
+        if (payload == null || payload.isEmpty())
+            return WatermarkResult.failure("水印载荷为空");
+
+        // 包装为单虚拟列的 List<Map<String, Object>> 后复用 Table API
+        List<Map<String, Object>> table = new ArrayList<>(values.size());
+        for (Object v : values) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put(VALUES_API_VIRTUAL_COLUMN, v);
+            table.add(row);
+        }
+
+        WatermarkResult<List<Map<String, Object>>> tableResult =
+                embed(table, VALUES_API_VIRTUAL_COLUMN_LIST, payload, strategies);
+
+        if (!tableResult.isSuccess()) {
+            return WatermarkResult.failure(tableResult.getMessage());
+        }
+
+        // 展平回 List<Object>
+        List<Object> result = new ArrayList<>(tableResult.getData().size());
+        for (Map<String, Object> row : tableResult.getData()) {
+            result.add(row.get(VALUES_API_VIRTUAL_COLUMN));
+        }
+
+        WatermarkResult<List<Object>> r =
+                WatermarkResult.success(result, null, tableResult.getRepetition());
+        r.setWatermarkType(tableResult.getWatermarkType());
+        return r;
+    }
+
+    /**
+     * 提取水印（值序列 API）。
+     * <p>
+     * 自动尝试 bit-level 和 simple 两种模式，返回最可靠结果。
+     * 嵌入与提取必须使用相同的序列顺序。
+     * </p>
+     */
+    public WatermarkResult<String> extract(List<?> values) {
+        if (values == null || values.isEmpty())
+            return WatermarkResult.failure("值序列为空");
+
+        List<Map<String, Object>> table = new ArrayList<>(values.size());
+        for (Object v : values) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put(VALUES_API_VIRTUAL_COLUMN, v);
+            table.add(row);
+        }
+
+        return extract(table, VALUES_API_VIRTUAL_COLUMN_LIST);
+    }
+
     // ==================== Bit-level 嵌入/提取 ====================
 
     /**

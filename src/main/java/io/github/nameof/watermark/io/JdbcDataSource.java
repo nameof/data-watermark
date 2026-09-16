@@ -50,7 +50,6 @@ public class JdbcDataSource implements DataSource {
         if (whereClause != null && !whereClause.trim().isEmpty()) {
             sql += " WHERE " + whereClause;
         }
-
         List<String> columnNames = new ArrayList<>();
         List<Map<String, Object>> rows = new ArrayList<>();
 
@@ -90,11 +89,16 @@ public class JdbcDataSource implements DataSource {
         createSql.append("CREATE TABLE IF NOT EXISTS `").append(newTableName).append("` (");
         for (int i = 0; i < columns.size(); i++) {
             String col = columns.get(i);
-            String sqlType = inferSqlType(rows.get(0).get(col));
+            // 逐列扫描全部行取第一个非 null 值推断类型（首行为 null 时不再退化）
+            String sqlType = inferSqlType(rows, col);
             createSql.append("`").append(col).append("` ").append(sqlType);
             if (i < columns.size() - 1) createSql.append(", ");
         }
-        createSql.append(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+        createSql.append(")");
+        // MySQL 专属表选项（utf8mb4 对零宽字符水印必需），其他数据库跳过
+        if (isMySql()) {
+            createSql.append(" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+        }
 
         try (Statement stmt = connection.createStatement()) {
             stmt.executeUpdate(createSql.toString());
@@ -128,7 +132,15 @@ public class JdbcDataSource implements DataSource {
 
     @Override
     public void createTableLike(String sourceTable, String newTable) throws Exception {
-        String sql = "CREATE TABLE IF NOT EXISTS `" + newTable + "` LIKE `" + sourceTable + "`";
+        String sql;
+        if (isMySql()) {
+            // MySQL：LIKE 完整复制列类型、默认值、注释等属性
+            sql = "CREATE TABLE IF NOT EXISTS `" + newTable + "` LIKE `" + sourceTable + "`";
+        } else {
+            // 可移植写法：仅复制列结构，不含数据
+            sql = "CREATE TABLE IF NOT EXISTS `" + newTable + "` AS SELECT * FROM `"
+                    + sourceTable + "` WHERE 1=0";
+        }
         try (Statement stmt = connection.createStatement()) {
             stmt.executeUpdate(sql);
         }
@@ -153,6 +165,32 @@ public class JdbcDataSource implements DataSource {
     }
 
     /**
+     * 判断底层连接是否为 MySQL。
+     */
+    private boolean isMySql() {
+        try {
+            String product = connection.getMetaData().getDatabaseProductName();
+            return product != null && product.toLowerCase(java.util.Locale.ROOT).contains("mysql");
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /**
+     * 逐列扫描所有行，用第一个非 null 值推断 SQL 列类型。
+     * 全列为 null 时退化为 VARCHAR(500)。
+     */
+    private String inferSqlType(List<Map<String, Object>> rows, String column) {
+        for (Map<String, Object> row : rows) {
+            Object value = row.get(column);
+            if (value != null) {
+                return inferSqlType(value);
+            }
+        }
+        return "VARCHAR(500)";
+    }
+
+    /**
      * 根据 Java 对象类型推断 SQL 列类型。
      */
     private String inferSqlType(Object value) {
@@ -167,7 +205,8 @@ public class JdbcDataSource implements DataSource {
         }
         if (value instanceof BigDecimal) {
             BigDecimal bd = (BigDecimal) value;
-            int precision = Math.max(bd.precision(), 10);
+            // scale 不得超过 precision，否则 DECIMAL(p,s) 非法
+            int precision = Math.max(Math.max(bd.precision(), bd.scale()), 10);
             int scale = Math.max(bd.scale(), 2);
             return "DECIMAL(" + precision + "," + scale + ")";
         }
@@ -175,10 +214,12 @@ public class JdbcDataSource implements DataSource {
             return "DOUBLE";
         }
         if (value instanceof Boolean) {
-            return "TINYINT(1)";
+            // BOOLEAN 在 MySQL 中等价于 TINYINT(1)，且为标准 SQL，可移植
+            return "BOOLEAN";
         }
-        if (value instanceof java.sql.Date || value instanceof java.util.Date) {
-            return "DATETIME";
+        if (value instanceof java.sql.Timestamp || value instanceof java.sql.Date
+                || value instanceof java.util.Date) {
+            return isMySql() ? "DATETIME" : "TIMESTAMP";
         }
         // 默认使用 VARCHAR
         String str = value.toString();
