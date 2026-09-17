@@ -28,16 +28,16 @@ public class SimpleWatermarkerTest {
 
         // 嵌入
         assertTrue(strategy.canWatermark("张三"));
-        String embedded = strategy.embed("张三", PAYLOAD, SECRET, 0);
+        String embedded = strategy.embed("张三", PAYLOAD, SECRET, 0L);
         System.out.println("SuffixMarker 嵌入结果: [" + embedded + "]");
         assertTrue("嵌入后应包含标记", embedded.contains("[::" + PAYLOAD + "::]"));
 
         // 提取
-        String extracted = strategy.extract(embedded, SECRET, 0);
+        String extracted = strategy.extract(embedded, SECRET, 0L);
         assertEquals("提取的载荷应与原始一致", PAYLOAD, extracted);
 
         // 无水印时返回 null
-        assertNull("原始文本应返回 null", strategy.extract("张三", SECRET, 0));
+        assertNull("原始文本应返回 null", strategy.extract("张三", SECRET, 0L));
     }
 
     @Test
@@ -45,12 +45,12 @@ public class SimpleWatermarkerTest {
         SuffixMarkerStrategy strategy = new SuffixMarkerStrategy();
 
         // 多次嵌入应覆盖而非叠加
-        String first = strategy.embed("张三", "payload1", SECRET, 0);
-        String second = strategy.embed(first, "payload2", SECRET, 0);
+        String first = strategy.embed("张三", "payload1", SECRET, 0L);
+        String second = strategy.embed(first, "payload2", SECRET, 0L);
         System.out.println("多次嵌入结果: [" + second + "]");
 
         // 应只包含最后一次嵌入的载荷
-        assertEquals("payload2", strategy.extract(second, SECRET, 0));
+        assertEquals("payload2", strategy.extract(second, SECRET, 0L));
         assertFalse("不应包含第一次的载荷", second.contains("payload1"));
     }
 
@@ -62,7 +62,7 @@ public class SimpleWatermarkerTest {
 
         // 嵌入
         assertTrue(strategy.canWatermark("张三"));
-        String embedded = strategy.embed("张三", PAYLOAD, SECRET, 0);
+        String embedded = strategy.embed("张三", PAYLOAD, SECRET, 0L);
         System.out.println("InvisiblePadding 嵌入结果长度: " + embedded.length()
                 + " (原始: 2, 增加: " + (embedded.length() - 2) + " 零宽字符)");
 
@@ -70,11 +70,11 @@ public class SimpleWatermarkerTest {
         assertTrue("嵌入后应以原始文本开头", embedded.startsWith("张三"));
 
         // 提取
-        String extracted = strategy.extract(embedded, SECRET, 0);
+        String extracted = strategy.extract(embedded, SECRET, 0L);
         assertEquals("提取的载荷应与原始一致", PAYLOAD, extracted);
 
         // 无水印时返回 null
-        assertNull("原始文本应返回 null", strategy.extract("张三", SECRET, 0));
+        assertNull("原始文本应返回 null", strategy.extract("张三", SECRET, 0L));
     }
 
     @Test
@@ -82,10 +82,10 @@ public class SimpleWatermarkerTest {
         InvisiblePaddingStrategy strategy = new InvisiblePaddingStrategy();
 
         // 多次嵌入应覆盖而非叠加
-        String first = strategy.embed("张三", "payload1", SECRET, 0);
-        String second = strategy.embed(first, "payload2", SECRET, 0);
+        String first = strategy.embed("张三", "payload1", SECRET, 0L);
+        String second = strategy.embed(first, "payload2", SECRET, 0L);
 
-        assertEquals("payload2", strategy.extract(second, SECRET, 0));
+        assertEquals("payload2", strategy.extract(second, SECRET, 0L));
     }
 
     // ==================== Watermarker simple 模式多数投票测试 ====================

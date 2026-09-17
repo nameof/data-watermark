@@ -14,10 +14,14 @@
 - **两种 Simple 嵌入策略**
   - 后缀标记 → 可见标记 `[::payload::]`，最简单直观
   - 隐形填充 → 零宽字符编码完整载荷，肉眼不可见
+- **两种数据形态 API**（共用同一套核心算法，调用方按场景二选一）：
+  - **Table API**：`embed(List<Map<String,Object>>, List<String>, payload)` —— 适合数据库/CSV，自带列名语义
+  - **Values API**：`embed(List<?>, payload)` —— 适合 JSON 数组、文档字符序列、纯 `List<String>` 等非表格场景，无需列名
 - **数据源抽象（io 层）**：`DataSource` 接口 + CSV 实现，可与 `Watermarker` 自由组合
+- **数据库适配层（database 层）**：`DatabaseWatermarker` 提供分块嵌入/提取 + 跨块聚合，调用方实现 `ChunkSource` 即可对接任意数据源（JDBC / CSV / 内存 / 自定义）
 - **Java 8** 兼容，无第三方运行时依赖
 
-> 🚧 **开发中**：数据库表级一键集成（`DatabaseWatermarker`，含大数据切片、多表提取报告、报告图片生成）。
+> ✅ **新增**：`DatabaseWatermarker` 已稳定。`io` 包仍保留作为低层数据源抽象，但 Database 层是面向分块 + 聚合的推荐入口。
 
 ## Maven 依赖
 
@@ -56,6 +60,12 @@ io.github.nameof.watermark/
     ├── TableData.java                 # 表数据 DTO
     ├── JdbcDataSource.java            # JDBC 实现
     └── CsvDataSource.java             # CSV 实现
+
+└── database/                          # 数据库适配层（2026-09 新增）
+    ├── ChunkSource.java               # 分块数据源接口（调用方实现）
+    ├── DatabaseWatermarker.java       # 委托 core.Watermarker，含分块+聚合
+    ├── DatabaseEmbedResult.java       # 嵌入结果（含 modifiedTable 用于写回）
+    └── DatabaseExtractResult.java     # 提取结果（多数投票 payload + 加权 confidence）
 ```
 
 ### 分层设计
@@ -65,6 +75,7 @@ io.github.nameof.watermark/
 | 载体层（策略） | `core.bit` / `core.simple` | 在**单个值**中隐蔽地嵌入/提取 1 bit 或完整载荷 | 单值 |
 | 编码/扩频层 | `core.Watermarker` | 载荷 → bit 流 → 冗余分布到多个值（两段式头部、交叉分配、多数投票、CRC32） | 多值/数据集 |
 | 数据源层 | `io` | 表数据的读取与写回（CSV/JDBC） | 表 |
+| 数据库适配层 | `database` | 分块嵌入/提取 + 跨块聚合统计；对数据源零知识（不依赖 JDBC/SQL） | 分块 |
 
 > 一次完整水印的嵌入天然需要多个值：bit-level 模式下每个单元格只承载 1 bit，
 > 由 `Watermarker` 负责把载荷编码为 bit 流并冗余分布到整个数据集。
@@ -250,7 +261,34 @@ String payload = suffix.extract(embedded, "secret", 0L);
 > 单独使用 bit 策略时没有冗余保护：值被修改（如零宽字符被清洗）该 bit 即丢失。
 > 完整载荷的嵌入请使用 `Watermarker`，由它负责冗余分配和多数投票。
 
-### 5. CSV 数据源组合
+### 5. 值序列 API（无需列名，非表格场景）
+
+适合没有「列」概念的数据：JSON 数组、文档字符序列、`List<String>` 等。
+Values API 与 Table API 共用同一套核心算法，仅外部数据形态不同 —— 调用方决定用哪个。
+
+```java
+import io.github.nameof.watermark.core.*;
+import java.util.*;
+
+// 准备任意类型的 ListObject
+List<String> emails = new ArrayList<>();
+for (int i = 0; i < 500; i++) emails.add("用户" + i + "@example.com");
+
+Watermarker watermarker = new Watermarker(new WatermarkConfig("my-secret-key"));
+
+// 嵌入（自动选策略）
+WatermarkResult<List<Object>> embedResult = watermarker.embed(emails, "operator:zhangsan");
+if (embedResult.isSuccess()) {
+    // 提取
+    WatermarkResult<String> result = watermarker.extract(embedResult.getData());
+    System.out.println("载荷: " + result.getData());
+}
+```
+
+> **Seed 约定**：Values API 的 seed 由值在序列中的索引生成。**嵌入与提取必须传入顺序一致的序列**。
+> 此约束与 Table API 的「行序固定」完全同构。
+
+### 6. CSV 数据源组合
 
 通过 `io` 层的 `DataSource` 读取表数据，用 `Watermarker` 嵌入后写回。
 
