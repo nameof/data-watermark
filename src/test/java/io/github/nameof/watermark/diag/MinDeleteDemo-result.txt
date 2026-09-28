@@ -1,0 +1,5 @@
+﻿bit 妗ｅ祵鍏? success=true repetition=11 type=BIT_CHINESE_ZERO_WIDTH
+[1] bit 妗?  涓嶅垹浠讳綍琛?      -> OK   payload="test"
+[2] bit 妗?  鍒犱腑闂寸100琛?   -> OK   payload="test"
+[3] bit 妗?  鍒犲熬閮ㄦ渶鍚?琛?   -> OK   payload="test"
+[4] simple 妗?闅忔満鍒?00琛?20%) -> OK   payload="test"

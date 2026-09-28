@@ -162,13 +162,35 @@ public class LatinTextWatermarkStrategy implements BitCarrierStrategy {
      * 用于嵌入 bit 0（"无同形字"即代表 bit 0）以及覆盖旧水印。
      */
     private String normalizeHomoglyphs(String str) {
+        return stripHomoglyphs(str);
+    }
+
+    /**
+     * 把文本中的西里尔同形字统一还原为 ASCII（幂等，可被核心层复用）。
+     * <p>
+     * 核心层用它计算"稳定键"：该策略承载的信息是"有没有同形字"，
+     * 还原成 ASCII 后即得到与嵌入前一致的稳定值。
+     * </p>
+     *
+     * @param str 输入文本，可为 null
+     * @return 还原后的文本；入参为 null 时返回 null
+     */
+    public static String stripHomoglyphs(String str) {
+        if (str == null) return null;
         StringBuilder sb = new StringBuilder(str.length());
         for (int i = 0; i < str.length(); i++) {
             char c = str.charAt(i);
-            char ascii = findAscii(c);
+            char ascii = findAsciiStatic(c);
             sb.append(ascii != 0 ? ascii : c);
         }
         return sb.toString();
+    }
+
+    private static char findAsciiStatic(char homoglyph) {
+        for (char[] pair : HOMOGlyph_MAP) {
+            if (pair[1] == homoglyph) return pair[0];
+        }
+        return 0;
     }
 
     /**

@@ -29,3 +29,5 @@ Thumbs.db
 
 # JVM crash logs
 hs_err_pid*
+
+.workbuddy/

@@ -26,11 +26,13 @@ import java.util.*;
  *   <li><b>编码/扩频层（本类，多值粒度）</b>：一次完整水印的嵌入天然需要多个值。
  *       本类负责把载荷编码为 bit 流，并冗余分布到整个数据集：
  *       <ul>
- *         <li><b>两段式编码</b>（bit-level 模式）：前 HEADER_BITS×3 = 24 个单元格编码
- *             8-bit 长度头部，剩余单元格编码载荷+CRC32。提取时先读头部确定精确长度。</li>
- *         <li><b>交叉分配</b>（bit-level 模式）：每个 bit 的 R 个副本均匀分布在整个
- *             数据范围内（cell j → bit j%N），删除任意连续区域只影响每个 bit 的少量副本，
- *             通过多数投票恢复，容忍高达 (R-1)/R 比例的数据丢失。</li>
+ *         <li><b>两段式编码</b>（bit-level 模式）：头部 8 个槽位编码 8-bit 长度头部，
+ *             其余槽位编码载荷+CRC32。提取时先读头部确定精确长度
+ *             （长度反过来决定槽位总数，故提取端按候选长度扫描，用 CRC32 定夺）。</li>
+ *         <li><b>稳定键哈希分桶</b>（bit-level 模式）：每个单元格按**自身内容的稳定键**
+ *             认领槽位（{@code slot = mixHash(secret, cellKey) % (24 + N)}），与行序无关。
+ *             因此任意位置的增删行只会损失该单元格自己的 1 票，其余副本不受影响，
+ *             通过多数投票恢复，真正达到 (R-1)/R 比例的删除容忍度。</li>
  *         <li><b>独立编码</b>（simple 模式）：每个单元格独立承载完整载荷，提取时做多数投票。</li>
  *         <li><b>密钥流置乱</b>（bit-level 模式）：载荷 bit 在嵌入前与密钥派生的
  *             0/1 密钥流异或，提取时对称还原——不知道密钥则 CRC32 校验失败，
@@ -43,9 +45,12 @@ import java.util.*;
  *
  * <h2>容量需求（bit-level）</h2>
  * <p>
- * 总单元格 M = 头部(24) + 载荷区(M-24)。
- * 载荷 bit 数 N = (1 + payloadLen + 4) × 8，重复因子 R = (M-24) / N。
- * 需要 R ≥ config.minRepetition（默认 5）才能可靠提取。
+ * 载荷 bit 数 N = (1 + payloadLen + 4) × 8，槽位总数 = 8（头部）+ N。
+ * 重复因子 R = <b>独立投票者数</b> ÷ 槽位总数，需要 R ≥ config.minRepetition（默认 5）。
+ * </p>
+ * <p>
+ * “独立投票者”指内容互不相同的单元格：位槽由内容的稳定键决定，
+ * 内容相同（或数值列经末位量化后相撞）的单元格会共享同一槽位、只贡献 1 票。
  * </p>
  *
  * <h2>数据量约定</h2>
@@ -57,14 +62,35 @@ import java.util.*;
  */
 public class Watermarker {
 
-    /** 头部 bit 数：8 bit 可表示 0-255 字节载荷长度 */
+    /** 长度字段 bit 数：8 bit 表示 (载荷字节数 + 5) */
     private static final int HEADER_BITS = 8;
-    /** 头部重复因子：每个头部 bit 由 3 个单元格投票 */
-    private static final int HEADER_REP = 3;
-    /** 头部占用单元格数 */
-    private static final int HEADER_CELLS = HEADER_BITS * HEADER_REP; // 24
-    /** 载荷最大字节数（UTF-8），受 8-bit 头部长度字段约束并为编码开销留余量 */
-    public static final int MAX_PAYLOAD_BYTES = 251;
+    /**
+     * 头部占用槽位数：每个头部 bit 一个槽。
+     * <p>
+     * <b>为什么不是 24</b>：旧实现（位置取模）把头部固定写在前 24 个单元格里，
+     * 只能靠"1 个 bit 占 3 格"凑出 3 票冗余（{@code HEADER_REP=3}）。
+     * 改用稳定键哈希分桶后，每个槽天然获得约 R 个投票者，
+     * 头部槽与载荷槽享受同样的冗余 —— 因此 1 槽/bit 即可，
+     * 头部开销从 24 槽降为 8 槽（省下的槽位全部给载荷，R 相应提高）。
+     * </p>
+     */
+    private static final int HEADER_CELLS = HEADER_BITS; // 8
+    /**
+     * 提取时允许的"零票槽"上限。
+     * <p>
+     * 数据被删除后，某些位可能一个投票者都不剩（取值未知）。这些位用穷举补全 + CRC32
+     * 校验找回；上限用来避免候选数爆炸（2^k 次 CRC 校验）。
+     * </p>
+     */
+    private static final int MAX_ERASURES = 12;
+    /**
+     * 载荷最大字节数（UTF-8）。
+     * <p>
+     * 头部用 8 bit 表示 (载荷字节数 + 5)，可表示 0..255，故载荷上限为 250 字节。
+     * （旧值 251 会让 256 溢出为 0，头部读回长度为 0 → 提取必然失败。）
+     * </p>
+     */
+    public static final int MAX_PAYLOAD_BYTES = 250;
 
     private final WatermarkConfig config;
     private final List<BitCarrierStrategy> bitStrategies;
@@ -219,13 +245,32 @@ public class Watermarker {
      * @return 提取结果
      */
     public WatermarkResult<String> extract(List<Map<String, Object>> table, List<String> columns) {
+        return extract(table, columns, null);
+    }
+
+    /**
+     * 提取水印（可指定策略白名单）。
+     * <p>
+     * <b>types 必须与嵌入端传入的一致</b>：否则同一个值在两端可能路由到不同策略
+     * （例如值里既有中文又有拉丁字母、而显式只指定了 Chinese 策略时，
+     * extract 若不过滤就会走 Latin，提取结果恒为 0 → 失败）。
+     * 传 null 表示不限，对应"自动选择策略"的嵌入路径。
+     * </p>
+     *
+     * @param table   表数据
+     * @param columns 包含水印的列名列表
+     * @param types   策略白名单，null 表示不限
+     * @return 提取结果
+     */
+    public WatermarkResult<String> extract(List<Map<String, Object>> table, List<String> columns,
+                                           List<WatermarkType> types) {
         if (table == null || table.isEmpty())
             return WatermarkResult.failure("表数据为空");
         if (columns == null || columns.isEmpty())
             return WatermarkResult.failure("列名列表为空");
 
         // 尝试两种模式的提取
-        WatermarkResult<String> bitResult = extractBitLevel(table, columns);
+        WatermarkResult<String> bitResult = extractBitLevel(table, columns, types);
         WatermarkResult<String> simpleResult = extractSimple(table, columns);
 
         boolean bitOk = bitResult.isSuccess();
@@ -285,9 +330,10 @@ public class Watermarker {
      * （JSON 数组、文档字符序列、纯 {@code List<String>} 等）。
      * </p>
      * <p>
-     * <b>Seed 约定</b>：内部将值序列包装为单虚拟列的 table 后复用 Table API，
-     * seed 由值在序列中的索引生成（等价于 {@code cellSeed(i, 0)}）。
-     * 调用方必须保证嵌入与提取时传入的序列顺序一致。
+     * <b>Seed / 顺序约定</b>（ADR-0002 方案 A 起）：内部将值序列包装为单虚拟列的 table 后复用
+     * Table API；bit-level 的位槽由每个值自身的**稳定键**（剥离水印痕迹后的原值哈希）决定，
+     * 与序列顺序无关。simple 模式本就每个值独立承载完整载荷，也与顺序无关。
+     * 因此嵌入与提取之间**允许增删值、允许乱序**。
      * </p>
      *
      * @param values  值序列
@@ -344,10 +390,27 @@ public class Watermarker {
      * 提取水印（值序列 API）。
      * <p>
      * 自动尝试 bit-level 和 simple 两种模式，返回最可靠结果。
-     * 嵌入与提取必须使用相同的序列顺序。
+     * </p>
+     * <p>
+     * <b>顺序无关</b>（ADR-0002 方案 A 起）：bit-level 的位槽由每个值自身的稳定键决定，
+     * 不再依赖它在序列中的位置，因此删除值、新增值、乱序都不会导致位槽错位。
      * </p>
      */
     public WatermarkResult<String> extract(List<?> values) {
+        return extractValues(values, null);
+    }
+
+    /**
+     * 提取水印（值序列 API，指定策略白名单）。
+     *
+     * <p>方法名带 {@code Values} 后缀是为了避开与 Table API
+     * {@code extract(List, List)} 的泛型擦除冲突。</p>
+     *
+     * @param values 值序列
+     * @param types  策略白名单，须与嵌入端一致；null 表示不限
+     * @return 提取结果
+     */
+    public WatermarkResult<String> extractValues(List<?> values, List<WatermarkType> types) {
         if (values == null || values.isEmpty())
             return WatermarkResult.failure("值序列为空");
 
@@ -358,7 +421,7 @@ public class Watermarker {
             table.add(row);
         }
 
-        return extract(table, VALUES_API_VIRTUAL_COLUMN_LIST);
+        return extract(table, VALUES_API_VIRTUAL_COLUMN_LIST, types);
     }
 
     // ==================== Bit-level 嵌入/提取 ====================
@@ -384,52 +447,77 @@ public class Watermarker {
         for (int i = 0; i < payloadBits.length; i++) payloadBits[i] ^= keyStream[i];
         int N = payloadBits.length;
 
-        // 3. 容量检查
-        int payloadCells = M - HEADER_CELLS;
-        int R = payloadCells / N;
+        // 3. 容量检查：槽总数 = 头部槽(8) + 载荷槽(N)，每个槽由落在其中的单元格投票。
+        //    冗余必须按**独立投票者**衡量：哈希分桶是"按内容认领槽位"，
+        //    内容相同的单元格（含数值列经 LSB 量化后相撞的情形）会落进同一个槽、
+        //    投同一个 bit，只贡献 1 票独立信息，不能按单元格数虚高计算。
+        int slotTotal = HEADER_CELLS + N;
+        String[] keys = new String[M];
+        Set<String> distinctKeys = new HashSet<String>();
+        for (int i = 0; i < M; i++) {
+            keys[i] = stableKey(cells.get(i).value);
+            distinctKeys.add(keys[i]);
+        }
+        int voters = distinctKeys.size();
+        int R = voters / slotTotal;
         if (R < config.getMinRepetition()) {
-            int maxBytes = (payloadCells / config.getMinRepetition()) / 8 - 5;
+            int maxEncoded = voters / config.getMinRepetition() - HEADER_CELLS;
+            int maxBytes = Math.max(0, maxEncoded / 8 - 5);
             return WatermarkResult.failure(
-                "可嵌入单元格不足（" + M + "个），载荷需要 " + N + " bits（重复因子仅 " + R + "）。"
-                + "建议：增加数据行数或缩短载荷（当前最多支持 " + Math.max(0, maxBytes) + " 字节）。");
+                "可嵌入单元格不足（共 " + M + " 个，其中内容互不相同的仅 " + voters + " 个），载荷需要 "
+                + N + " bits（重复因子仅 " + R + "）。"
+                + "建议：增加数据行数、改用内容更多样的列、或缩短载荷（当前最多支持 "
+                + maxBytes + " 字节）；数据会被增删的场景也可直接用 simple 模式。");
+        }
+
+        // 3b. 分桶：单元格的槽位由自身内容的稳定键决定，与行序无关。
+        //     哈希分桶是随机的，可能出现"空槽"（该位一个投票者都没有）；
+        //     提取端会用穷举补全处理，但空洞过多就补不过来了，这里先卡上限。
+        int[] cellSlots = new int[M];
+        int[] hits = new int[slotTotal];
+        for (int i = 0; i < M; i++) {
+            int slot = slotOf(mixHash(keys[i], 0), slotTotal);
+            cellSlots[i] = slot;
+            hits[slot]++;
+        }
+        int emptySlots = 0;
+        for (int s = 0; s < slotTotal; s++) {
+            if (hits[s] == 0) emptySlots++;
+        }
+        if (emptySlots > MAX_ERASURES) {
+            return WatermarkResult.failure(
+                "位槽分布过于稀疏：共 " + slotTotal + " 个槽，其中 " + emptySlots
+                + " 个没有任何单元格命中（上限 " + MAX_ERASURES + "）。"
+                + "建议：增加数据行数或缩短载荷，或改用 simple 模式。");
         }
 
         // 4. 深拷贝
         List<Map<String, Object>> result = new ArrayList<>(table.size());
         for (Map<String, Object> row : table) result.add(new LinkedHashMap<>(row));
 
-        // 5. 嵌入头部：载荷字节长度 → 8 bits，每 bit 重复 3 次
+        // 5. 头部 bits：载荷字节长度 → 8 bit，每个 bit 占 1 个槽（冗余来自哈希落点）
         int payloadByteLen = encoded.length;
         int[] headerBits = new int[HEADER_BITS];
         for (int i = 0; i < HEADER_BITS; i++) {
             headerBits[i] = (payloadByteLen >> (7 - i)) & 1;
         }
-        for (int i = 0; i < HEADER_CELLS; i++) {
-            int bitPos = i / HEADER_REP;
+
+        // 6. 按稳定键分桶嵌入：单元格的槽位由它自己的内容决定，与行序无关
+        for (int i = 0; i < M; i++) {
             CellRef cell = cells.get(i);
             Object value = result.get(cell.row).get(cell.column);
             BitCarrierStrategy strategy = findBitStrategy(value, types);
-            if (strategy != null) {
-                long seed = cellSeed(cell.row, cell.colIndex);
-                BitEmbedResult er = strategy.embed(value, headerBits[bitPos], config.getSecret(), seed);
-                if (er.isEmbedded()) {
-                    result.get(cell.row).put(cell.column, er.getValue());
-                }
-            }
-        }
+            if (strategy == null) continue;
 
-        // 6. 嵌入载荷：交叉分配，每组包含全部 N 个 bit
-        for (int i = 0; i < payloadCells; i++) {
-            int bitPos = i % N;
-            CellRef cell = cells.get(HEADER_CELLS + i);
-            Object value = result.get(cell.row).get(cell.column);
+            int slot = cellSlots[i];
+            int bit = (slot < HEADER_CELLS)
+                    ? headerBits[slot]
+                    : payloadBits[slot - HEADER_CELLS];
+
             long seed = cellSeed(cell.row, cell.colIndex);
-            BitCarrierStrategy strategy = findBitStrategy(value, types);
-            if (strategy != null) {
-                BitEmbedResult er = strategy.embed(value, payloadBits[bitPos], config.getSecret(), seed);
-                if (er.isEmbedded()) {
-                    result.get(cell.row).put(cell.column, er.getValue());
-                }
+            BitEmbedResult er = strategy.embed(value, bit, config.getSecret(), seed);
+            if (er.isEmbedded()) {
+                result.get(cell.row).put(cell.column, er.getValue());
             }
         }
 
@@ -457,103 +545,134 @@ public class Watermarker {
     /**
      * Bit-level 提取。
      */
-    private WatermarkResult<String> extractBitLevel(List<Map<String, Object>> table, List<String> columns) {
-        List<CellRef> cells = scanCellsForBit(table, columns, null);
+    /**
+     * Bit-level 提取（稳定键哈希分桶 + 候选扫描）。
+     *
+     * @param types 与嵌入端一致的策略白名单；null 表示不限（自动选择路径）
+     */
+    private WatermarkResult<String> extractBitLevel(List<Map<String, Object>> table, List<String> columns,
+                                                    List<WatermarkType> types) {
+        List<CellRef> cells = scanCellsForBit(table, columns, types);
         int M = cells.size();
         if (M <= HEADER_CELLS)
             return WatermarkResult.failure("可提取单元格不足，无法还原水印");
 
-        // 1. 提取头部：前 24 个单元格 → 8 bits（每 3 个一组多数投票）
-        int payloadByteLen = 0;
+        // 稳定键哈希与 bit 值都与载荷长度无关，先各算一次
+        long[] hashes = new long[M];
+        int[] bits = new int[M];
+        for (int i = 0; i < M; i++) {
+            CellRef cell = cells.get(i);
+            hashes[i] = mixHash(stableKey(cell.value), 0);
+            BitCarrierStrategy strategy = findBitStrategy(cell.value, types);
+            bits[i] = strategy == null ? -1
+                    : strategy.extract(cell.value, config.getSecret(), cellSeed(cell.row, cell.colIndex));
+        }
+
+        // 槽位数依赖载荷长度、载荷长度又写在头部里 —— 用候选扫描破环：
+        // 只接受"头部自洽（读出的长度 == 假设值）且 CRC32 通过"的那一个长度。
+        for (int enc = 5; enc <= MAX_PAYLOAD_BYTES + 5; enc++) {
+            WatermarkResult<String> r = tryExtractWithLength(cells, hashes, bits, enc);
+            if (r != null) return r;
+        }
+        return WatermarkResult.failure("CRC32 校验不匹配（可能数据变动过大或密钥不匹配）");
+    }
+
+    /**
+     * 按指定的编码长度尝试解码；头部不自洽或 CRC 不通过时返回 null。
+     */
+    private WatermarkResult<String> tryExtractWithLength(
+            List<CellRef> cells, long[] hashes, int[] bits, int enc) {
+        int M = cells.size();
+        int N = enc * 8;
+        int slotTotal = HEADER_CELLS + N;
+
+        // 1. 头部：每个 bit 由落在它那个槽里的单元格多数投票（1 槽/bit）
+        int[] headerBits = new int[HEADER_BITS];
         for (int b = 0; b < HEADER_BITS; b++) {
             int ones = 0, total = 0;
-            for (int j = b * HEADER_REP; j < (b + 1) * HEADER_REP && j < M; j++) {
-                CellRef cell = cells.get(j);
-                BitCarrierStrategy strategy = findAnyBitStrategy(cell.value);
-                if (strategy != null) {
-                    long seed = cellSeed(cell.row, cell.colIndex);
-                    int bit = strategy.extract(cell.value, config.getSecret(), seed);
-                    if (bit >= 0) {
-                        total++;
-                        if (bit == 1) ones++;
-                    }
-                }
+            for (int i = 0; i < M; i++) {
+                if (bits[i] < 0) continue;
+                int slot = (int) Math.floorMod(hashes[i], (long) slotTotal);
+                if (slot != b) continue;
+                total++;
+                if (bits[i] == 1) ones++;
             }
-            int headerBit = (total > 0 && ones > total / 2) ? 1 : 0;
-            payloadByteLen = (payloadByteLen << 1) | headerBit;
+            headerBits[b] = (total > 0 && ones > total / 2) ? 1 : 0;
         }
+        int payloadByteLen = 0;
+        for (int b = 0; b < HEADER_BITS; b++) payloadByteLen = (payloadByteLen << 1) | headerBits[b];
 
-        // 2. 验证载荷长度合理性
-        if (payloadByteLen < 5 || payloadByteLen > 256) {
-            return WatermarkResult.failure("头部长度异常: " + payloadByteLen);
-        }
+        // 自洽性检查：头部读出的长度必须等于本次假设的长度
+        if (payloadByteLen != enc) return null;
 
-        // 3. 提取载荷 bits
-        int N = payloadByteLen * 8;
-        int payloadCells = M - HEADER_CELLS;
-        int R = payloadCells / N;
-        if (R < 1)
-            return WatermarkResult.failure("可提取单元格不足，无法还原水印");
-
+        // 2. 载荷：按槽位多数投票
         int[] onesCount = new int[N];
         int[] totalCount = new int[N];
-
-        for (int i = 0; i < payloadCells; i++) {
-            int bitPos = i % N;
-            CellRef cell = cells.get(HEADER_CELLS + i);
-            BitCarrierStrategy strategy = findAnyBitStrategy(cell.value);
-            if (strategy != null) {
-                long seed = cellSeed(cell.row, cell.colIndex);
-                int bit = strategy.extract(cell.value, config.getSecret(), seed);
-                if (bit >= 0) {
-                    totalCount[bitPos]++;
-                    if (bit == 1) onesCount[bitPos]++;
-                }
-            }
+        for (int i = 0; i < M; i++) {
+            if (bits[i] < 0) continue;
+            int slot = (int) Math.floorMod(hashes[i], (long) slotTotal);
+            if (slot < HEADER_CELLS) continue;
+            int bitPos = slot - HEADER_CELLS;
+            totalCount[bitPos]++;
+            if (bits[i] == 1) onesCount[bitPos]++;
         }
 
-        // 4. 多数投票恢复 bits，再用同一密钥流还原（嵌入时做过对称置乱）
+        // 3. 多数投票恢复 bits，再用同一密钥流还原（嵌入时做过对称置乱）
         int[] recovered = new int[N];
+        int minVotes = Integer.MAX_VALUE;
         for (int b = 0; b < N; b++) {
             recovered[b] = (totalCount[b] > 0 && onesCount[b] > totalCount[b] / 2) ? 1 : 0;
+            minVotes = Math.min(minVotes, totalCount[b]);
         }
         int[] keyStream = keyStream(N);
         for (int b = 0; b < N; b++) recovered[b] ^= keyStream[b];
 
-        // 5. 解码并验证 CRC32
-        byte[] bytes = bitsToBytes(recovered);
-        String decoded = tryDecodePayload(bytes, payloadByteLen);
-        if (decoded != null) {
-            Set<String> usedColumns = new LinkedHashSet<>();
-            for (CellRef cell : cells) usedColumns.add(cell.column);
-
-            // 计算提取统计
-            int validTotal = 0;
-            int consistentBits = 0;
-            for (int b = 0; b < N; b++) {
-                if (totalCount[b] > 0) {
-                    validTotal++;
-                    int majority = onesCount[b] > totalCount[b] / 2 ? 1 : 0;
-                    int majorityCount = majority == 1 ? onesCount[b] : (totalCount[b] - onesCount[b]);
-                    if (totalCount[b] > 0 && majorityCount > totalCount[b] / 2) {
-                        consistentBits++;
-                    }
-                }
-            }
-            double conf = validTotal > 0 ? (consistentBits * 100.0 / validTotal) : -1;
-
-            // 检测实际使用的水印类型
-            WatermarkType detectedType = detectBitWatermarkType(cells);
-
-            WatermarkResult<String> r = WatermarkResult.extractSuccess(decoded, new ArrayList<>(usedColumns), R);
-            r.setWatermarkType(detectedType);
-            r.setTotalCells(M);
-            r.setValidExtractions(validTotal);
-            r.setConfidence(conf);
-            return r;
+        // 4. 零票槽（数据被删除后可能出现"某位一个投票者都不剩"）：该位取值未知，
+        //    穷举补全（2^k 种）后用 CRC32 挑出唯一正确的那一种。
+        //    注意：有票的槽一定是对的——投票者携带来的都是真实 bit，空槽只是"弃权"。
+        int erasures = 0;
+        int[] erasedPos = new int[N];
+        for (int b = 0; b < N; b++) {
+            if (totalCount[b] == 0) erasedPos[erasures++] = b;
         }
+        if (erasures > MAX_ERASURES) return null; // 空洞太多，放弃该候选
 
-        return WatermarkResult.failure("CRC32 校验不匹配");
+        String decoded = null;
+        if (erasures == 0) {
+            decoded = tryDecodePayload(bitsToBytes(recovered), payloadByteLen);
+        } else {
+            int[] guess = recovered.clone();
+            int combos = 1 << erasures;
+            for (int mask = 0; mask < combos && decoded == null; mask++) {
+                for (int e = 0; e < erasures; e++) {
+                    guess[erasedPos[e]] = (mask >> e) & 1;
+                }
+                decoded = tryDecodePayload(bitsToBytes(guess), payloadByteLen);
+            }
+        }
+        if (decoded == null) return null;
+
+        Set<String> usedColumns = new LinkedHashSet<>();
+        for (CellRef cell : cells) usedColumns.add(cell.column);
+
+        int validTotal = 0, consistentBits = 0;
+        for (int b = 0; b < N; b++) {
+            if (totalCount[b] > 0) {
+                validTotal++;
+                int majority = onesCount[b] > totalCount[b] / 2 ? 1 : 0;
+                int majorityCount = majority == 1 ? onesCount[b] : (totalCount[b] - onesCount[b]);
+                if (majorityCount > totalCount[b] / 2) consistentBits++;
+            }
+        }
+        double conf = validTotal > 0 ? (consistentBits * 100.0 / validTotal) : -1;
+
+        WatermarkResult<String> r = WatermarkResult.extractSuccess(
+                decoded, new ArrayList<>(usedColumns), Math.max(0, minVotes));
+        r.setWatermarkType(detectBitWatermarkType(cells));
+        r.setTotalCells(M);
+        r.setValidExtractions(validTotal);
+        r.setConfidence(conf);
+        return r;
     }
 
     // ==================== Simple 嵌入/提取 ====================
@@ -675,7 +794,11 @@ public class Watermarker {
         if (M > HEADER_CELLS) {
             byte[] encoded = encodePayload(payload);
             int N = encoded.length * 8;
-            int R = (M - HEADER_CELLS) / N;
+            // 冗余按"独立投票者"计（内容互不相同的单元格），与 embedBitLevel 的判定口径一致，
+            // 否则会出现"预估容量够 → 实际嵌入失败 → 静默降级 simple"。
+            Set<String> distinctKeys = new HashSet<String>();
+            for (CellRef c : bitCells) distinctKeys.add(stableKey(c.value));
+            int R = distinctKeys.size() / (HEADER_CELLS + N);
             if (R >= config.getMinRepetition()) {
                 // bit-level 容量足够，收集实际支持的 bit-level 类型
                 List<WatermarkType> bitTypes = new ArrayList<>();
@@ -861,6 +984,115 @@ public class Watermarker {
             }
         }
         return WatermarkType.SIMPLE_SUFFIX_MARKER;
+    }
+
+    // ---------- 稳定键与位槽分配（ADR-0002 方案 A）----------
+
+    /**
+     * 计算单元格的稳定键：把值上的水印痕迹剥掉后得到的“原值”。
+     * <p>
+     * 位槽分配依赖它——只要单元格内容不变，键就不变，
+     * **与该单元格在序列中的位置无关**，因此任意位置的增删行都不会影响其他单元格的槽位。
+     * </p>
+     */
+    private String stableKey(Object value) {
+        if (value == null) return "";
+        // 先剥掉三类水印痕迹，还原出"原始值"
+        String original;
+        if (value instanceof Number) {
+            original = value.toString();
+        } else {
+            String s = value.toString();
+            s = stripZeroWidth(s);
+            s = stripSuffixMarker(s);
+            original = LatinTextWatermarkStrategy.stripHomoglyphs(s);
+        }
+        // 数值（含"长成数值的字符串"，例如数据库 CHAR/VARCHAR 列里存的金额）
+        // 必须抹掉最低位再量化：数值水印藏在末位（±1 微扰），
+        // 不量化的话嵌入前后的键会漂移（"10000.00" → "10000.01"），槽位随之改变。
+        String trimmed = original.trim();
+        if (looksNumeric(trimmed)) return quantizedNumericKey(trimmed);
+        return original;
+    }
+
+    /**
+     * 判断字符串是否可解析为数值。
+     * <p>口径与 {@link io.github.nameof.watermark.core.bit.NumericWatermarkStrategy#canWatermark(Object)}
+     * 保持一致，避免"策略认它是数值改了末位、而稳定键却按文本算"的错配。</p>
+     */
+    private boolean looksNumeric(String s) {
+        if (s == null || s.isEmpty()) return false;
+        try {
+            Double.parseDouble(s);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    /**
+     * 数值列的稳定键：去掉最低位后量化。
+     * <p>
+     * 数值水印藏在末位（±1 微扰），除以 2 取整可抹掉该差异，
+     * 使嵌入前后算出的键一致。
+     * </p>
+     */
+    private String quantizedNumericKey(Object value) {
+        String text = value.toString().trim();
+        try {
+            java.math.BigDecimal bd = new java.math.BigDecimal(text);
+            int scale = Math.max(0, bd.scale());
+            return bd.movePointRight(scale).toBigInteger().shiftRight(1).toString();
+        } catch (NumberFormatException e) {
+            // 极端数值文本（"NaN"/"Infinity" 等能通过 parseDouble 但 BigDecimal 不认）：
+            // 退化为原文本，至少保证嵌入端与提取端算出同一个键
+            return text;
+        }
+    }
+
+    /** 剥离零宽字符（U+200B..U+200F）。 */
+    private String stripZeroWidth(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < '\u200B' || c > '\u200F') sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    /** 剥离后缀标记 {@code [::...::]}（mixed 模式下可能出现在值里）。 */
+    private String stripSuffixMarker(String s) {
+        int start = s.indexOf("[::");
+        while (start >= 0) {
+            int end = s.indexOf("::]", start);
+            if (end < 0) break;
+            s = s.substring(0, start) + s.substring(end + 3);
+            start = s.indexOf("[::");
+        }
+        return s;
+    }
+
+    /**
+     * 稳定键哈希：把密钥与键混合成稳定的数值。
+     * <p>
+     * 只依赖 {@code key} 与 {@code secret}，不依赖 JVM、不依赖调用顺序，
+     * 保证嵌入端与提取端算出同一槽位。
+     * </p>
+     */
+    private long mixHash(String key, int nonce) {
+        long h = 1125899906842597L ^ config.getSecret().hashCode()
+                ^ (0x9E3779B97F4A7C15L * (nonce + 1));
+        for (int i = 0; i < key.length(); i++) {
+            h = 31 * h + key.charAt(i);
+        }
+        h = (h ^ (h >>> 33)) * 0xff51afd7ed558ccdL;
+        h = (h ^ (h >>> 33)) * 0xc4ceb9fe1a85ec53L;
+        return h ^ (h >>> 33);
+    }
+
+    /** 计算单元格的位槽：[0, slotTotal)。 */
+    private int slotOf(long hash, int slotTotal) {
+        return (int) Math.floorMod(hash, (long) slotTotal);
     }
 
     // ---------- 载荷编码/解码 ----------

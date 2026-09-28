@@ -89,7 +89,10 @@ public class WatermarkerTest {
 
     @Test
     public void testBitLevelRobustnessAfterDataLoss() {
-        List<Map<String, Object>> table = createTestTable(500);
+        // 用足够大的数据量，确保**真的走 bit-level**（而不是容量不足被静默降级成 simple）。
+        // 历史教训：本测试原用 500 行 × 2 列 = 1000 单元格 / 30 字节载荷，
+        // 实际 R < minRepetition → 自动降级 simple，名字叫 bit-level 却从未测过 bit-level。
+        List<Map<String, Object>> table = createTestTable(1000);
         // 只使用中文列，避免数值列干扰
         List<String> columns = Arrays.asList("name", "address");
 
@@ -99,20 +102,26 @@ public class WatermarkerTest {
         // 嵌入
         WatermarkResult<List<Map<String, Object>>> embedResult =
                 watermarker.embed(table, columns, PAYLOAD);
-        assertTrue("嵌入应成功", embedResult.isSuccess());
+        assertTrue("嵌入应成功: " + embedResult.getMessage(), embedResult.isSuccess());
+        assertTrue("本测试必须真正走 bit-level（容量不足会静默降级为 simple），实际类型: "
+                + embedResult.getWatermarkType(),
+                embedResult.getWatermarkType() != null && embedResult.getWatermarkType().isBitLevel());
 
-        // 模拟数据丢失：清除前 40% 的行（保留行索引不变）
-        List<Map<String, Object>> damaged = new ArrayList<>(embedResult.getData());
-        for (int i = 0; i < 200; i++) {
-            damaged.set(i, new LinkedHashMap<>(damaged.get(i)));
-            for (String col : columns) damaged.get(i).put(col, null);
+        // 模拟业务删除：**真实删除中间 30% 的行**。
+        // （旧版此处只是把值置 null 且保留索引，掩盖了"位槽随位置漂移"类缺陷）
+        List<Map<String, Object>> damaged = new ArrayList<>();
+        for (int i = 0; i < embedResult.getData().size(); i++) {
+            if (i >= 350 && i < 650) continue; // 删掉中间 300 行
+            damaged.add(new LinkedHashMap<>(embedResult.getData().get(i)));
         }
 
-        // 提取（多数投票应仍能恢复）
+        // 提取（稳定键分桶应保证未被删除的单元格仍认得自己的槽位）
         WatermarkResult<String> extractResult = watermarker.extract(damaged, columns);
-        assertTrue("部分数据丢失后仍应能提取: " + extractResult.getMessage(), extractResult.isSuccess());
+        assertTrue("删除中间 30% 行后仍应能提取: " + extractResult.getMessage(), extractResult.isSuccess());
         assertEquals("载荷应一致", PAYLOAD, extractResult.getData());
-        System.out.println("Bit-level 健壮性测试通过 | 清除 40% 数据后仍成功提取");
+        assertTrue("提取出的水印类型应为 bit-level",
+                extractResult.getWatermarkType() != null && extractResult.getWatermarkType().isBitLevel());
+        System.out.println("Bit-level 删除鲁棒性测试通过 | 删除中间 300 行后仍成功提取");
     }
 
     @Test
@@ -136,6 +145,50 @@ public class WatermarkerTest {
         assertTrue("提取应成功", extractResult.isSuccess());
         assertEquals("载荷应一致", PAYLOAD, extractResult.getData());
         System.out.println("指定策略嵌入/提取成功");
+    }
+
+    // ---- ADR-0002 回归：位槽由内容决定，任意位置增删行 / 乱序 / 追加都必须能还原 ----
+
+    @Test
+    public void testBitLevelSurvivesHeadTailAndRandomDeletion() {
+        // 1200 行 × 2 列 = 2400 单元格；30 字节载荷 → 288 槽，R ≈ 8.3。
+        // 随机删 50% 后每槽仍有约 4 票，足以多数投票。
+        List<Map<String, Object>> table = createTestTable(1200);
+        List<String> columns = Arrays.asList("name", "address");
+
+        Watermarker watermarker = new Watermarker(new WatermarkConfig(SECRET));
+        WatermarkResult<List<Map<String, Object>>> embedResult =
+                watermarker.embed(table, columns, PAYLOAD);
+        assertTrue("嵌入应成功: " + embedResult.getMessage(), embedResult.isSuccess());
+        assertTrue("必须走 bit-level（实际 " + embedResult.getWatermarkType() + "）",
+                embedResult.getWatermarkType() != null && embedResult.getWatermarkType().isBitLevel());
+
+        List<Map<String, Object>> marked = embedResult.getData();
+
+        // (a) 删头部 20% —— 旧实现里头部固定占最前面 24 格，是重灾区
+        assertExtractOk(watermarker, columns, slice(marked, 240, marked.size()), "删头部 20%");
+        // (b) 删尾部 20%
+        assertExtractOk(watermarker, columns, slice(marked, 0, marked.size() - 240), "删尾部 20%");
+        // (c) 随机删 50%（旧实现下必挂）
+        Random rnd = new Random(42);
+        List<Map<String, Object>> half = new ArrayList<>();
+        for (Map<String, Object> row : marked) {
+            if (rnd.nextBoolean()) half.add(row);
+        }
+        assertExtractOk(watermarker, columns, half, "随机删约 50%");
+        // (d) 整体乱序（位槽与顺序无关，应无影响）
+        List<Map<String, Object>> shuffled = new ArrayList<>(marked);
+        Collections.shuffle(shuffled, new Random(7));
+        assertExtractOk(watermarker, columns, shuffled, "整体乱序");
+        // (e) 追加 200 行无水印数据（新增行的单元格提取不到 bit，应弃权而非投错票）
+        List<Map<String, Object>> appended = new ArrayList<>(marked);
+        for (int i = 0; i < 200; i++) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("name", "新增用户" + i);
+            row.put("address", "新增地址街道" + i + "号");
+            appended.add(row);
+        }
+        assertExtractOk(watermarker, columns, appended, "追加 200 行无水印数据");
     }
 
     // ==================== Simple 嵌入/提取测试 ====================
@@ -256,8 +309,9 @@ public class WatermarkerTest {
                 watermarker.embed(createTestTable(500), Arrays.asList("name", "address"), sb.toString());
 
         assertFalse("超长载荷嵌入应失败", result.isSuccess());
+        // 用常量而非硬编码数字，避免载荷上限调整后断言静默过期
         assertTrue("失败信息应说明长度限制: " + result.getMessage(),
-                result.getMessage().contains("251"));
+                result.getMessage().contains(String.valueOf(Watermarker.MAX_PAYLOAD_BYTES)));
     }
 
     @Test
@@ -517,11 +571,15 @@ public class WatermarkerTest {
 
     @Test
     public void testNumericOnlyDataEndToEnd() {
+        // 注意数值列的位槽分配：水印藏在末位（±1 微扰），稳定键按"抹掉末位"量化
+        // （quantizedNumericKey → floor(v/2)），所以**相邻整数会共享同一个位槽**、
+        // 只贡献 1 票独立冗余——连续自增的数值列（如流水号）有效冗余会腰斩。
+        // 这里用奇数步长模拟真实金额（不连续），使 800 个值两两不碰撞。
         List<Map<String, Object>> table = new ArrayList<>();
         for (int i = 0; i < 400; i++) {
             Map<String, Object> row = new LinkedHashMap<>();
-            row.put("salary", 10000 + i);
-            row.put("bonus", 500 + i);
+            row.put("salary", 10000 + i * 7);
+            row.put("bonus", 500 + i * 11);
             table.add(row);
         }
         List<String> columns = Arrays.asList("salary", "bonus");
@@ -539,6 +597,26 @@ public class WatermarkerTest {
     }
 
     // ==================== 辅助方法 ====================
+
+    /**
+     * 取 [from, to) 区间的行（深拷贝），用于模拟"删掉两端若干行"。
+     */
+    private List<Map<String, Object>> slice(List<Map<String, Object>> rows, int from, int to) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (int i = from; i < to; i++) out.add(new LinkedHashMap<>(rows.get(i)));
+        return out;
+    }
+
+    /**
+     * 断言在该数据形态下仍能还原出水印载荷。
+     */
+    private void assertExtractOk(Watermarker watermarker, List<String> columns,
+                                 List<Map<String, Object>> data, String scene) {
+        WatermarkResult<String> r = watermarker.extract(data, columns);
+        assertTrue(scene + " 后仍应能提取: " + r.getMessage(), r.isSuccess());
+        assertEquals(scene + " 后载荷应一致", PAYLOAD, r.getData());
+        System.out.println("删除鲁棒性 OK | " + scene + " | 类型 " + r.getWatermarkType());
+    }
 
     /**
      * 创建包含中文文本和数值的测试数据。

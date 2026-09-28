@@ -1,0 +1,88 @@
+=== SETUP ===
+bit-level embed : success=true repetition=6 type=BIT_CHINESE_ZERO_WIDTH msg=null
+原序列 500 个值，显式策略 = BIT_CHINESE_ZERO_WIDTH，payload = "test"
+
+=== E0 现有测试走的到底是哪条路径？ ===
+  testEmbedExtractRoundTripBitLevel: 500 值 + 31 字节载荷 + 自动选策略 -> type=SIMPLE_SUFFIX_MARKER repetition=500   (SIMPLE 说明自动降级，并未走 bit-level)
+  testValuesApiSurvivesPartialDeletion 删的是【尾部】30%，索引未变，所以通过
+
+=== E1 基线（不删任何行）===
+  no deletion                                success=true  payload="test"   conf=100.0%  msg=-
+
+=== E2 删除【中间】1 行（模拟业务删行，与尾删对照）===
+  delete index 100 (middle)                  success=false payload=-        conf=-1.0%  msg=无法还原有效的水印载荷。可能数据被大量删除或修改，或使用了错误的密钥。
+  delete index 250 (middle)                  success=false payload=-        conf=-1.0%  msg=无法还原有效的水印载荷。可能数据被大量删除或修改，或使用了错误的密钥。
+  delete index 0   (head)                    success=false payload=-        conf=-1.0%  msg=无法还原有效的水印载荷。可能数据被大量删除或修改，或使用了错误的密钥。
+  delete index 23  (last header cell)        success=false payload=-        conf=-1.0%  msg=无法还原有效的水印载荷。可能数据被大量删除或修改，或使用了错误的密钥。
+  delete index 499 (tail, 索引不变)              success=true  payload="test"   conf=100.0%  msg=-
+  delete tail 3 rows (index 497..499)        success=true  payload="test"   conf=100.0%  msg=-
+
+=== E3 按比例删除 ===
+  keep first 70%  (只砍尾部 30%)                 success=true  payload="test"   conf=100.0%  msg=-
+  keep 70% but randomly scattered (10 trials) : success 0/10
+
+=== E4 顺序扰动（不删除，只换序）===
+  swap index 100 <-> 101                     success=true  payload="test"   conf=100.0%  msg=-
+  rotate left by 1 (row moved head->tail)    success=false payload=-        conf=-1.0%  msg=无法还原有效的水印载荷。可能数据被大量删除或修改，或使用了错误的密钥。
+
+=== E5 只改值不删行（索引/行数都不变，把水印洗掉）===
+  overwrite index 0        (毁 1 个头部单元)       success=true  payload="test"   conf=100.0%  msg=-
+  overwrite index 0..23    (全部 24 个头部单元)     success=false payload=-        conf=-1.0%  msg=无法还原有效的水印载荷。可能数据被大量删除或修改，或使用了错误的密钥。
+  overwrite index 24..73   (载荷区 50 个)        success=true  payload="test"   conf=100.0%  msg=-
+  overwrite index 100..199 (载荷区 100 个)       success=true  payload="test"   conf=100.0%  msg=-
+  overwrite index 100..294 (载荷区 195 个)       success=true  payload="test"   conf=100.0%  msg=-
+
+=== E6 删除行数的临界扫描：随机删 k 行，20 次试验的成功次数 ===
+  delete k=1 random rows -> success 9/20
+  delete k=2 random rows -> success 6/20
+  delete k=3 random rows -> success 1/20
+  delete k=4 random rows -> success 0/20
+  delete k=5 random rows -> success 0/20
+  delete k=6 random rows -> success 0/20
+  delete k=7 random rows -> success 0/20
+  delete k=8 random rows -> success 0/20
+  delete k=9 random rows -> success 0/20
+  delete k=10 random rows -> success 0/20
+
+=== E7 simple 模式（SuffixMarker）同样删行 ===
+simple embed: success=true type=SIMPLE_SUFFIX_MARKER
+  no deletion                                success=true  payload="test"   conf=100.0%  msg=-
+  delete 30% random                          success=true  payload="test"   conf=100.0%  msg=-
+  delete first 25% (head)                    success=true  payload="test"   conf=100.0%  msg=-
+  delete 50% random                          success=true  payload="test"   conf=100.0%  msg=-
+
+=== E8 单策略层面：embed 用 seed=S1，extract 换成 S2 / 换 secret 会怎样？ ===
+  ChineseText   bit=1 embed(seed=111) -> extract(seed=111)=1  extract(seed=999999)=1  extract(other-secret)=1
+  ChineseText   bit=0 embed(seed=111) -> extract(seed=111)=0  extract(seed=999999)=0  extract(other-secret)=0
+  -> 插入位置确实随 seed 变，但 extract 扫描全文找第一个零宽字符，不看 seed/secret
+  SuffixMarker  extract(seed=111)=test  extract(seed=999999)=test  extract(other-secret)=test
+  Numeric       extract(seed=111)=1  extract(seed=999999)=1  embed 端也完全不用 seed（只看奇偶）
+  InvisiblePad  extract(seed=111)=test  extract(seed=999999)=test
+
+=== E11 显式指定中文策略、但值里含拉丁字母（真实业务列常见）===
+  embed (types=[BIT_CHINESE_ZERO_WIDTH]) : success=true type=BIT_CHINESE_ZERO_WIDTH R=6
+    extract（无策略参数）                           success=false payload=-        conf=-1.0%  msg=无法还原有效的水印载荷。可能数据被大量删除或修改，或使用了错误的密钥。
+  第 50 个值的路由探测: Latin.canWatermark=true -> Latin.extract=0 | Chinese.canWatermark=true -> Chinese.extract=1
+  -> embed 按 types 过滤（走了 Chinese），extract 用 findAnyBitStrategy 不按 types 过滤（走了 Latin）
+
+=== E9 PoC：交叉分配的位槽从「位置取模」改成「稳定键哈希」后，删 50% 是否还能还原 ===
+  payload="WM2026" -> N=48 bits, 500 个单元格
+  (a) 位置取模  删 50% -> 还原 = "A)<@B,"  FAIL
+  (b) 键哈希分桶 删 50% -> 还原 = "WM2026"  OK
+  (c) 位置取模  只删尾部 50% -> 还原 = "WM2026"  OK
+
+=== E10 Database 分块路径（5 块 x 500 行，每块独立嵌完整载荷，跨块多数投票）===
+  chunk 0 embed: rowsModified=500 cells=500 cols=[name] usage={BIT_CHINESE_ZERO_WIDTH=500}
+  chunk 1 embed: rowsModified=500 cells=500 cols=[name] usage={BIT_CHINESE_ZERO_WIDTH=500}
+  chunk 2 embed: rowsModified=500 cells=500 cols=[name] usage={BIT_CHINESE_ZERO_WIDTH=500}
+  chunk 3 embed: rowsModified=500 cells=500 cols=[name] usage={BIT_CHINESE_ZERO_WIDTH=500}
+  chunk 4 embed: rowsModified=500 cells=500 cols=[name] usage={BIT_CHINESE_ZERO_WIDTH=500}
+
+  (a) 不动任何行                 -> perChunk[0:test 1:test 2:test 3:test 4:test] -> aggregated="test" conf=100%
+  (b) 只删第 3 块中间 1 行        -> perChunk[0:test 1:test 2:未还原 3:test 4:test] -> aggregated="test" conf=100%
+  (c) 每块都删中间 1 行           -> perChunk[0:未还原 1:未还原 2:未还原 3:未还原 4:未还原] -> aggregated=<none> conf=0%
+  (d) 每块各删 5 行（分散）        -> perChunk[0:未还原 1:未还原 2:未还原 3:未还原 4:未还原] -> aggregated=<none> conf=0%
+  (e) 每块只删最后 1 行           -> perChunk[0:test 1:test 2:test 3:test 4:test] -> aggregated="test" conf=100%
+  (f) 提取时改成每块 400 行       -> perChunk[0:test 1:未还原 2:未还原 3:未还原 4:未还原 5:test 6:未还原] -> aggregated="test" conf=100%
+  (g) 提取时改成每块 600 行       -> perChunk[0:test 1:未还原 2:未还原 3:未还原 4:未还原] -> aggregated="test" conf=100%
+
