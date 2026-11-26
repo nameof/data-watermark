@@ -249,17 +249,18 @@ public class Watermarker {
     }
 
     /**
-     * 提取水印（可指定策略白名单）。
+     * 提取水印（可指定候选策略白名单）。
      * <p>
-     * <b>types 必须与嵌入端传入的一致</b>：否则同一个值在两端可能路由到不同策略
-     * （例如值里既有中文又有拉丁字母、而显式只指定了 Chinese 策略时，
-     * extract 若不过滤就会走 Latin，提取结果恒为 0 → 失败）。
-     * 传 null 表示不限，对应"自动选择策略"的嵌入路径。
+     * {@code types} 是<b>候选策略过滤</b>（缩小两端尝试的策略范围），不是逐格路由依据：
+     * 提取端按每个单元格上实际存在的水印痕迹自动选择策略，
+     * 因此无需与嵌入端逐格一致；传 null/空表示不限，对应"自动选择策略"的嵌入路径。
      * </p>
+     * <p>bit-level 侧仍按白名单路由（三个 bit 策略的 {@code canWatermark} 近似互斥，
+     * 过滤可避免值被错误类别的策略认领而恒投 0 票）。</p>
      *
      * @param table   表数据
      * @param columns 包含水印的列名列表
-     * @param types   策略白名单，null 表示不限
+     * @param types   候选策略白名单，null 表示不限
      * @return 提取结果
      */
     public WatermarkResult<String> extract(List<Map<String, Object>> table, List<String> columns,
@@ -271,7 +272,7 @@ public class Watermarker {
 
         // 尝试两种模式的提取
         WatermarkResult<String> bitResult = extractBitLevel(table, columns, types);
-        WatermarkResult<String> simpleResult = extractSimple(table, columns);
+        WatermarkResult<String> simpleResult = extractSimple(table, columns, types);
 
         boolean bitOk = bitResult.isSuccess();
         boolean simpleOk = simpleResult.isSuccess();
@@ -725,10 +726,24 @@ public class Watermarker {
     }
 
     /**
-     * Simple 提取（多数投票）。
+     * Simple 提取（多数投票 + 痕迹探测）。
+     * <p>
+     * 不用 {@code canWatermark} 做前置路由——它只回答"能否嵌入"，而两个 simple 策略
+     * 对任意非空字符串都返回 true，按它选第一个策略会把 InvisiblePadding 嵌入的数据
+     * 误判给 SuffixMarker 导致整票丢失。这里改为直接逐个调用候选策略的
+     * {@code extract}，由策略自身的水印痕迹判断（无 {@code [::} 标记 → null；
+     * 无零宽序列 / 长度非 8 倍数 → null）决定该单元格是否是自己嵌入的：
+     * 采纳第一个返回非 null 的结果（短路，每格至多 1 票，与嵌入端
+     * "第一个命中"的口径一致）。
+     * </p>
+     *
+     * @param types 候选策略过滤（按注册顺序筛选）；null/空表示全部候选
      */
-    private WatermarkResult<String> extractSimple(List<Map<String, Object>> table, List<String> columns) {
+    private WatermarkResult<String> extractSimple(List<Map<String, Object>> table, List<String> columns,
+                                                  List<WatermarkType> types) {
+        List<SimpleWatermarkStrategy> candidates = candidateSimpleStrategies(types);
         Map<String, Integer> votes = new LinkedHashMap<>();
+        Map<WatermarkType, Integer> typeVotes = new EnumMap<>(WatermarkType.class);
         int totalExtracted = 0;
 
         for (int r = 0; r < table.size(); r++) {
@@ -737,13 +752,14 @@ public class Watermarker {
                 Object value = row.get(col);
                 if (value == null) continue;
 
-                SimpleWatermarkStrategy strategy = findAnySimpleStrategy(value);
-                if (strategy != null) {
-                    long seed = rowSeed(r);
+                long seed = rowSeed(r);
+                for (SimpleWatermarkStrategy strategy : candidates) {
                     String extracted = strategy.extract(value, config.getSecret(), seed);
-                    if (extracted != null) {
+                    if (extracted != null && isPlausiblePayload(extracted)) {
                         votes.merge(extracted, 1, Integer::sum);
+                        typeVotes.merge(strategy.type(), 1, Integer::sum);
                         totalExtracted++;
+                        break; // 短路：每格只采纳第一个命中的策略，避免同一格被两个策略各投一票
                     }
                 }
             }
@@ -766,8 +782,8 @@ public class Watermarker {
         Set<String> usedColumns = new LinkedHashSet<>(columns);
         double conf = totalExtracted > 0 ? (maxVotes * 100.0 / totalExtracted) : -1;
 
-        // 检测实际使用的水印类型
-        WatermarkType detectedType = detectSimpleWatermarkType(table, columns);
+        // 水印类型按"实际命中的策略"多数票判定（修复此前按 canWatermark 取第一个、恒报 SUFFIX_MARKER 的误报）
+        WatermarkType detectedType = detectSimpleWatermarkType(typeVotes);
 
         WatermarkResult<String> r = WatermarkResult.extractSuccess(winner, new ArrayList<>(usedColumns), totalExtracted);
         r.setWatermarkType(detectedType);
@@ -775,6 +791,26 @@ public class Watermarker {
         r.setValidExtractions(totalExtracted);
         r.setConfidence(conf);
         return r;
+    }
+
+    /**
+     * 粗筛提取结果的合理性，抑制"痕迹探测"引入的假阳性票：
+     * 真实水印载荷应是可打印文本，而乱码解码产物通常含 U+FFFD 替换字符或控制字符。
+     */
+    private static boolean isPlausiblePayload(String payload) {
+        if (payload.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < payload.length(); i++) {
+            char c = payload.charAt(i);
+            if (c == '\uFFFD') {
+                return false;
+            }
+            if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ==================== 策略自动选择 ====================
@@ -819,6 +855,10 @@ public class Watermarker {
         }
 
         // 降级到 simple
+        // 注意：这里有意返回"所有能匹配到的 simple 类型"（通常同时含 SUFFIX_MARKER 与
+        // INVISIBLE_PADDING，因二者 canWatermark 都对任意非空字符串为 true）。
+        // 嵌入端 embedSimple 按注册顺序取第一个命中者；提取端 extractSimple 按水印痕迹
+        // 逐个尝试候选策略消歧，所以多类型列表是安全的——不要"修"成单类型。
         List<WatermarkType> simpleTypes = new ArrayList<>();
         for (SimpleWatermarkStrategy s : simpleStrategies) {
             for (Map<String, Object> row : table) {
@@ -935,7 +975,12 @@ public class Watermarker {
     }
 
     /**
-     * 根据值查找匹配的 simple 策略。
+     * 根据值查找匹配的 simple 策略（<b>仅嵌入端</b>路由：按注册顺序取第一个
+     * {@code canWatermark} 命中者）。
+     * <p><b>提取端不要用本方法路由</b>——{@code canWatermark} 只回答"能否嵌入"，
+     * 两个 simple 策略对同一字符串都可能为 true，会把别的策略嵌入的数据误判到
+     * 先注册的策略上。提取端应使用 {@link #candidateSimpleStrategies(List)}
+     * 取候选列表后逐个调用 {@code extract}，由水印痕迹消歧。</p>
      */
     private SimpleWatermarkStrategy findSimpleStrategy(Object value, List<WatermarkType> types) {
         for (SimpleWatermarkStrategy s : simpleStrategies) {
@@ -946,12 +991,20 @@ public class Watermarker {
     }
 
     /**
-     * 查找任意匹配的 simple 策略（提取时使用）。
+     * 计算提取端可尝试的 simple 策略候选列表（保持注册顺序，与嵌入端口径一致）。
+     * {@code types} 为 null/空时返回全部已注册策略；否则按注册顺序过滤白名单。
      */
-    private SimpleWatermarkStrategy findAnySimpleStrategy(Object value) {
-        for (SimpleWatermarkStrategy s : simpleStrategies)
-            if (s.canWatermark(value)) return s;
-        return null;
+    private List<SimpleWatermarkStrategy> candidateSimpleStrategies(List<WatermarkType> types) {
+        if (types == null || types.isEmpty()) {
+            return simpleStrategies;
+        }
+        List<SimpleWatermarkStrategy> candidates = new ArrayList<>();
+        for (SimpleWatermarkStrategy s : simpleStrategies) {
+            if (types.contains(s.type())) {
+                candidates.add(s);
+            }
+        }
+        return candidates;
     }
 
     /**
@@ -969,21 +1022,20 @@ public class Watermarker {
     }
 
     /**
-     * 检测 simple 水印类型（通过检查第一个可嵌入单元格匹配的策略）。
+     * 检测 simple 水印类型：按提取过程中各策略<b>实际命中</b>的票数取多数。
+     * 平票时取先出现者（EnumMap 按枚举声明序迭代）；无任何命中时兜底
+     * {@code SIMPLE_SUFFIX_MARKER}（与历史行为一致）。
      */
-    private WatermarkType detectSimpleWatermarkType(List<Map<String, Object>> table, List<String> columns) {
-        for (Map<String, Object> row : table) {
-            for (String col : columns) {
-                Object value = row.get(col);
-                if (value == null) continue;
-                for (SimpleWatermarkStrategy s : simpleStrategies) {
-                    if (s.canWatermark(value)) {
-                        return s.type();
-                    }
-                }
+    private WatermarkType detectSimpleWatermarkType(Map<WatermarkType, Integer> typeVotes) {
+        WatermarkType best = null;
+        int max = 0;
+        for (Map.Entry<WatermarkType, Integer> e : typeVotes.entrySet()) {
+            if (e.getValue() > max) {
+                max = e.getValue();
+                best = e.getKey();
             }
         }
-        return WatermarkType.SIMPLE_SUFFIX_MARKER;
+        return best != null ? best : WatermarkType.SIMPLE_SUFFIX_MARKER;
     }
 
     // ---------- 稳定键与位槽分配（ADR-0002 方案 A）----------

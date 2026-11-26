@@ -135,13 +135,30 @@ public final class DatabaseWatermarker {
      * @return 本次提取的结果（含载荷、置信度、策略命中）
      */
     public DatabaseExtractResult extract(TableData chunk) {
+        return extract(chunk, null);
+    }
+
+    /**
+     * 从单块 {@link TableData} 提取水印，可指定候选策略白名单。
+     *
+     * <p>输入 {@code chunk} 不会被修改（提取是只读操作）。
+     *
+     * <p>{@code types} 是<b>候选策略过滤</b>（null/空表示不限）：提取端按每个单元格上
+     * 实际存在的水印痕迹自动选择策略，无需与嵌入端逐格一致；
+     * 显式指定可缩小候选范围（例如确认只有 InvisiblePadding 嵌入时）。
+     *
+     * @param chunk 待提取的数据块
+     * @param types 候选策略白名单；null/空表示全部
+     * @return 本次提取的结果（含载荷、置信度、策略命中）
+     */
+    public DatabaseExtractResult extract(TableData chunk, List<WatermarkType> types) {
         Objects.requireNonNull(chunk, "chunk");
 
         List<String> columns = chunk.getColumnNames();
         // 防御性拷贝：core.extract 不应该改输入，但仍拷贝以隔离外部副作用
         List<Map<String, Object>> rows = new ArrayList<>(chunk.getRows());
 
-        WatermarkResult<String> coreResult = core.extract(rows, columns);
+        WatermarkResult<String> coreResult = core.extract(rows, columns, types);
         return DatabaseExtractResult.fromCore(coreResult, chunk.getRowCount());
     }
 
@@ -216,13 +233,28 @@ public final class DatabaseWatermarker {
      * <p>输入数据不会被修改（提取是只读操作）。
      */
     public DatabaseExtractResult extract(ChunkSource source) throws Exception {
+        return extract(source, null);
+    }
+
+    /**
+     * 从 {@link ChunkSource} 提供的全部数据块顺序提取水印，跨块多数投票得出载荷，
+     * 可指定候选策略白名单（逐块用 {@code types} 过滤候选策略）。
+     *
+     * <p>输入数据不会被修改（提取是只读操作）。
+     *
+     * @param source 数据源，按块顺序提供数据
+     * @param types  候选策略白名单；null/空表示全部
+     * @return 跨块聚合后的提取结果
+     * @throws Exception 透传 {@link ChunkSource#hasNext()} / {@link ChunkSource#nextChunk()} 抛出的异常
+     */
+    public DatabaseExtractResult extract(ChunkSource source, List<WatermarkType> types) throws Exception {
         Objects.requireNonNull(source, "source");
 
         List<DatabaseExtractResult> partials = new ArrayList<>();
         try {
             while (source.hasNext()) {
                 TableData chunk = source.nextChunk();
-                partials.add(extract(chunk));
+                partials.add(extract(chunk, types));
             }
         } finally {
             try {
