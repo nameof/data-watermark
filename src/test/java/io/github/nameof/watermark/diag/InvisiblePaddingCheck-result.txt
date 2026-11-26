@@ -1,0 +1,7 @@
+[A] InvisiblePadding 嵌入: success=true type=SIMPLE_INVISIBLE_PADDING
+    [A] 第 0 个值原长=5 → 嵌入后长=150（差值即追加的零宽字符数，非 0 说明水印确实写进了内存对象）
+    [A] 显式指定策略提取: success=true msg=null
+    [A] 不指定策略提取: success=true msg=null
+[B] SuffixMarker 嵌入: success=true
+    [B] 第 0 个值嵌入后 = 用户0测试[::这是隐蔽信息::]
+    [B] 显式指定策略提取: success=true payload=这是隐蔽信息

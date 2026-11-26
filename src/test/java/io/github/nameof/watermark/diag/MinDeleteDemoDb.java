@@ -6,6 +6,7 @@ import io.github.nameof.watermark.core.WatermarkType;
 import io.github.nameof.watermark.core.Watermarker;
 
 import java.io.PrintWriter;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -22,12 +23,18 @@ import java.util.List;
  *   嵌入 -> UPDATE 写回库 -> 【人工删行：DELETE FROM ... WHERE id BETWEEN 200 AND 209】
  *        -> 重新 SELECT -> 提取还原
  *
- * 两个场景跑同一套流程，唯一区别是水印档位：
- *   场景 A：bit 档   （BIT_CHINESE_ZERO_WIDTH，隐蔽水印）
- *   场景 B：simple 档（SIMPLE_SUFFIX_MARKER，明文标记）
+ * 覆盖 **全部 5 个内置策略** + 自动选择路径，每个策略都跑同一套流程：
+ *   BIT_CHINESE_ZERO_WIDTH   （中文零宽字符，数据：中文文本）
+ *   BIT_LATIN_HOMOGLYPH      （拉丁同形字，  数据：含 a/e/o 等可替换字符的拉丁文本）
+ *   BIT_NUMERIC_LSB          （数值末位微扰，数据：DECIMAL(12,2) 金额列）
+ *   SIMPLE_SUFFIX_MARKER     （明文后缀标记，数据：中文文本）
+ *   SIMPLE_INVISIBLE_PADDING （零宽填充，    数据：中文文本）
+ *   自动选择（不指定 types）
+ *
+ * 另有「抗删梯度」：3 个 bit 策略 + 2 个 simple 策略各跑一次删中间 50%。
  *
  * 全程只使用临时表 watermark_delete_demo，结束自动 DROP，不影响任何业务表。
- * 运行：java MinDeleteDemoDb <输出文件>
+ * 运行：java io.github.nameof.watermark.diag.MinDeleteDemoDb <输出文件>
  */
 public class MinDeleteDemoDb {
 
@@ -38,7 +45,12 @@ public class MinDeleteDemoDb {
         + "&allowPublicKeyRetrieval=true";
     static final String USER = "root";
     static final String PASS = "root";
-    static final String TABLE = "watermark_delete_demo";
+    /**
+     * 临时表名。用独立名字（不复用旧 demo 的 watermark_delete_demo）：
+     * 若 IDE 里另有一个同名 demo 进程残留，它的 finally 会 DROP 掉同名的表，
+     * 导致本进程 CREATE 之后、INSERT 之前表被删（现象：DELETE 成功但 INSERT 报表不存在）。
+     */
+    static final String TABLE = "wm_diag_del_demo";
     /**
      * 行数：需满足 bit 档容量要求。
      * <p>
@@ -50,6 +62,11 @@ public class MinDeleteDemoDb {
     static final int ROWS = 1200;
     static final String PAYLOAD = "这是隐蔽信息";
 
+    /** 数据形态：决定建表数据与读写用的列 */
+    static final String CN = "cn";
+    static final String LATIN = "latin";
+    static final String NUM = "num";
+
     static PrintWriter out;
 
     public static void main(String[] args) throws Exception {
@@ -59,6 +76,23 @@ public class MinDeleteDemoDb {
             run();
         } finally {
             out.close();
+        }
+    }
+
+    /** 一个待验证场景：策略 + 数据形态。type == null 表示不指定策略（自动选择） */
+    static class Case {
+        final String name;
+        final WatermarkType type;
+        final String dataKind;
+
+        Case(String name, WatermarkType type, String dataKind) {
+            this.name = name;
+            this.type = type;
+            this.dataKind = dataKind;
+        }
+
+        List<WatermarkType> types() {
+            return type == null ? null : Collections.singletonList(type);
         }
     }
 
@@ -75,89 +109,43 @@ public class MinDeleteDemoDb {
             Statement st = conn.createStatement();
             st.execute("DROP TABLE IF EXISTS " + TABLE);
             st.execute("CREATE TABLE " + TABLE
-                + " (id INT PRIMARY KEY, val VARCHAR(200)) "
+                + " (id INT PRIMARY KEY, val VARCHAR(200), num DECIMAL(12,2)) "
                 + "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
             st.close();
-            p("已创建临时表 " + TABLE + "（" + ROWS + " 行中文数据）");
+            // 建表校验：排除"建成功但被别的进程删掉"的情况
+            ResultSet chk = conn.createStatement().executeQuery("SHOW TABLES LIKE '" + TABLE + "'");
+            boolean exists = chk.next();
+            chk.close();
+            p("已创建临时表 " + TABLE + "（" + ROWS + " 行）| 建表校验: "
+                + (exists ? "存在" : "不存在（异常！）"));
+            if (!exists) return;
 
             Watermarker wm = new Watermarker(new WatermarkConfig("demo-secret"));
 
-            // ================= 场景 A：bit 档 =================
+            // ============ 全覆盖：每个策略都跑「嵌入 -> 写回 -> 删中间 10 行 -> 还原」 ============
             p("");
-            p("========== 场景 A：bit 档（隐蔽水印）==========");
-            resetTable(conn);
-            p("A1. 嵌入并 UPDATE 写回库 ...");
-            WatermarkResult<List<Object>> er = wm.embed(
-                readVals(conn), PAYLOAD,
-                Collections.singletonList(WatermarkType.BIT_CHINESE_ZERO_WIDTH));
-            p("    嵌入 success=" + er.isSuccess() + " repetition=" + er.getRepetition());
-            if (!er.isSuccess()) {
-                p("    嵌入失败原因: " + er.getMessage());
-                p("    -> 跳过 A2~A4（未写入水印，删除测试无意义）");
-            } else {
-                writeBack(conn, er.getData());
+            p("========== 全覆盖：全部策略 + 自动选择（同一流程，删中间 10 行）==========");
+            Case[] all = {
+                new Case("BIT_CHINESE_ZERO_WIDTH", WatermarkType.BIT_CHINESE_ZERO_WIDTH, CN),
+                new Case("BIT_LATIN_HOMOGLYPH", WatermarkType.BIT_LATIN_HOMOGLYPH, LATIN),
+                new Case("BIT_NUMERIC_LSB", WatermarkType.BIT_NUMERIC_LSB, NUM),
+                new Case("SIMPLE_SUFFIX_MARKER", WatermarkType.SIMPLE_SUFFIX_MARKER, CN),
+                new Case("SIMPLE_INVISIBLE_PADDING", WatermarkType.SIMPLE_INVISIBLE_PADDING, CN),
+                new Case("自动选择（不指定 types）", null, LATIN),
+            };
+            for (Case c : all) runCase(wm, conn, c);
 
-                p("A2. 删行前先提取一次（验证写回没丢水印）:");
-                check(wm.extract(readVals(conn)));
-
-                p("A3. 【人工删行】执行 SQL: DELETE FROM " + TABLE + " WHERE id BETWEEN 200 AND 209;");
-                int del = conn.createStatement().executeUpdate(
-                    "DELETE FROM " + TABLE + " WHERE id BETWEEN 200 AND 209");
-                p("    实际删除 " + del + " 行（中间位置的 10 行）");
-
-                p("A4. 重新 SELECT 全表并提取还原:");
-                check(wm.extract(readVals(conn)));
-            }
-
-            // ================= 场景 A2：删除比例梯度 =================
-            // 哈希分桶下"删中间连续段"与"随机删"对槽位的影响等价（槽位由内容决定、与序号无关），
-            // 故用纯 SQL 删连续段来量化抗删边界；每个比例都重新嵌入一份干净数据。
+            // ============ 抗删梯度：各策略删中间 50% ============
             p("");
-            p("========== 场景 A2：bit 档抗删比例梯度（每次重新嵌入，SQL 删中间段）==========");
-            int[][] bands = {{540, 660, 10}, {420, 780, 30}, {300, 900, 50}};
-            for (int[] band : bands) {
-                resetTable(conn);
-                WatermarkResult<List<Object>> e = wm.embed(
-                    readVals(conn), PAYLOAD,
-                    Collections.singletonList(WatermarkType.BIT_CHINESE_ZERO_WIDTH));
-                if (!e.isSuccess()) {
-                    p("  删 " + band[2] + "% : 嵌入失败 -> " + e.getMessage());
-                    continue;
-                }
-                writeBack(conn, e.getData());
-                int d = conn.createStatement().executeUpdate(
-                    "DELETE FROM " + TABLE + " WHERE id >= " + band[0] + " AND id < " + band[1]);
-                p("  删 " + band[2] + "%（SQL 删 id " + band[0] + "~" + (band[1] - 1)
-                    + "，实际 " + d + " 行，剩 " + readVals(conn).size() + " 行）:");
-                check(wm.extract(readVals(conn)));
-            }
-
-            // ================= 场景 B：simple 档 =================
-            p("");
-            p("========== 场景 B：simple 档（同一流程对照）==========");
-            resetTable(conn);
-            p("B1. 嵌入并 UPDATE 写回库 ...");
-            WatermarkResult<List<Object>> er2 = wm.embed(
-                readVals(conn), PAYLOAD,
-                Collections.singletonList(WatermarkType.SIMPLE_SUFFIX_MARKER));
-            p("    嵌入 success=" + er2.isSuccess());
-            if (!er2.isSuccess()) {
-                p("    嵌入失败原因: " + er2.getMessage());
-                p("    -> 跳过 B2~B4");
-            } else {
-                writeBack(conn, er2.getData());
-
-                p("B2. 删行前先提取一次:");
-                check(wm.extract(readVals(conn)));
-
-                p("B3. 【人工删行】执行同样的 SQL（中间 10 行）...");
-                int del2 = conn.createStatement().executeUpdate(
-                    "DELETE FROM " + TABLE + " WHERE id BETWEEN 200 AND 209");
-                p("    实际删除 " + del2 + " 行");
-
-                p("B4. 重新 SELECT 全表并提取还原:");
-                check(wm.extract(readVals(conn)));
-            }
+            p("========== 抗删梯度：DELETE 中间 50%（id 300~899，剩 600 行）==========");
+            Case[] bands = {
+                new Case("BIT_CHINESE_ZERO_WIDTH", WatermarkType.BIT_CHINESE_ZERO_WIDTH, CN),
+                new Case("BIT_LATIN_HOMOGLYPH", WatermarkType.BIT_LATIN_HOMOGLYPH, LATIN),
+                new Case("BIT_NUMERIC_LSB", WatermarkType.BIT_NUMERIC_LSB, NUM),
+                new Case("SIMPLE_SUFFIX_MARKER", WatermarkType.SIMPLE_SUFFIX_MARKER, CN),
+                new Case("SIMPLE_INVISIBLE_PADDING", WatermarkType.SIMPLE_INVISIBLE_PADDING, CN),
+            };
+            for (Case c : bands) runHalfDeletion(wm, conn, c);
         } finally {
             try {
                 conn.createStatement().execute("DROP TABLE IF EXISTS " + TABLE);
@@ -168,38 +156,123 @@ public class MinDeleteDemoDb {
         }
     }
 
-    /** 重建 ROWS 行纯中文数据（id 0 .. ROWS-1，与 writeBack 的下标约定一致） */
-    static void resetTable(Connection conn) throws Exception {
+    /** 跑一个场景的完整流程：嵌入 -> 写回 -> 删行前提取 -> 删中间 10 行 -> 再提取 */
+    static void runCase(Watermarker wm, Connection conn, Case c) throws Exception {
+        p("");
+        p("---------- " + c.name + "（数据：" + kindDesc(c.dataKind) + "）----------");
+        resetTable(conn, c.dataKind);
+        List<WatermarkType> types = c.types();
+
+        WatermarkResult<List<Object>> er = wm.embed(readVals(conn, c.dataKind), PAYLOAD, types);
+        p("  1. 嵌入 success=" + er.isSuccess() + " repetition=" + er.getRepetition()
+            + " 实际类型=" + er.getWatermarkType());
+        if (!er.isSuccess()) {
+            p("     失败原因: " + er.getMessage());
+            p("     -> 跳过后续（未写入水印，删除测试无意义）");
+            return;
+        }
+
+        writeBack(conn, er.getData(), c.dataKind);
+
+        p("  2. 删行前提取（验证写回未丢水印）:");
+        check(extract(wm, readVals(conn, c.dataKind), types));
+
+        p("  3. 【人工删行】DELETE FROM " + TABLE + " WHERE id BETWEEN 200 AND 209;");
+        int del = conn.createStatement().executeUpdate(
+            "DELETE FROM " + TABLE + " WHERE id BETWEEN 200 AND 209");
+        p("     实际删除 " + del + " 行（中间位置的 10 行）");
+
+        p("  4. 重新 SELECT 并还原:");
+        check(extract(wm, readVals(conn, c.dataKind), types));
+    }
+
+    /** 跑一个场景的抗删梯度：嵌入 -> 写回 -> 删中间 50% -> 还原 */
+    static void runHalfDeletion(Watermarker wm, Connection conn, Case c) throws Exception {
+        resetTable(conn, c.dataKind);
+        List<WatermarkType> types = c.types();
+
+        WatermarkResult<List<Object>> e = wm.embed(readVals(conn, c.dataKind), PAYLOAD, types);
+        if (!e.isSuccess()) {
+            p("  " + c.name + " : 嵌入失败 -> " + e.getMessage());
+            return;
+        }
+        writeBack(conn, e.getData(), c.dataKind);
+
+        int d = conn.createStatement().executeUpdate(
+            "DELETE FROM " + TABLE + " WHERE id >= 300 AND id < 900");
+        p("  " + c.name + "（删 " + d + " 行，剩 " + readVals(conn, c.dataKind).size() + " 行）:");
+        check(extract(wm, readVals(conn, c.dataKind), types));
+    }
+
+    static WatermarkResult<String> extract(Watermarker wm, List<Object> vals, List<WatermarkType> types) {
+        return types == null ? wm.extract(vals) : wm.extractValues(vals, types);
+    }
+
+    static String kindDesc(String kind) {
+        if (NUM.equals(kind)) return "DECIMAL(12,2) 数值列";
+        if (LATIN.equals(kind)) return "拉丁文本";
+        return "中文文本";
+    }
+
+    /** 重建 ROWS 行数据（id 0 .. ROWS-1，与 writeBack 的下标约定一致） */
+    static void resetTable(Connection conn, String kind) throws Exception {
         Statement st = conn.createStatement();
         st.execute("DELETE FROM " + TABLE);
         st.close();
         PreparedStatement ps = conn.prepareStatement(
-            "INSERT INTO " + TABLE + " (id, val) VALUES (?, ?)");
+            "INSERT INTO " + TABLE + " (id, val, num) VALUES (?, ?, ?)");
         for (int i = 0; i < ROWS; i++) {
             ps.setInt(1, i);
-            ps.setString(2, "\u7528\u6237" + i + "\u6d4b\u8bd5"); // 用户i测试
+            ps.setString(2, textData(kind, i));
+            // 步长 7：数值水印藏在末位（±1 微扰），末位量化后 floor(v/2) 仍要求互不相同，
+            // 连续整数（步长 1）会两两碰撞 → 独立投票者腰斩。步长 7 可保证不碰撞。
+            ps.setBigDecimal(3, new BigDecimal(10000L + i * 7L).setScale(2));
             ps.addBatch();
         }
         ps.executeBatch();
         ps.close();
     }
 
-    /** SELECT val ... ORDER BY id -> List<Object>（与业务读库完全一致） */
-    static List<Object> readVals(Connection conn) throws Exception {
+    /** 各场景的文本列数据：必须匹配目标策略的 canWatermark 约束 */
+    static String textData(String kind, int i) {
+        if (LATIN.equals(kind)) {
+            // 含 a/e/o/x 等可替换字符，长度 >= 3，满足 Latin 策略
+            return "user" + i + "_test_data";
+        }
+        // 中文：含 >= 2 个汉字，满足 Chinese / SuffixMarker / InvisiblePadding
+        return "\u7528\u6237" + i + "\u6d4b\u8bd5"; // 用户i测试
+    }
+
+    /** 按场景读取目标列 -> List<Object>（与业务读库一致：数值列读 BigDecimal） */
+    static List<Object> readVals(Connection conn, String kind) throws Exception {
+        boolean numeric = NUM.equals(kind);
+        String col = numeric ? "num" : "val";
         List<Object> vals = new ArrayList<Object>();
         ResultSet rs = conn.createStatement().executeQuery(
-            "SELECT val FROM " + TABLE + " ORDER BY id");
-        while (rs.next()) vals.add(rs.getString(1));
+            "SELECT " + col + " FROM " + TABLE + " ORDER BY id");
+        while (rs.next()) {
+            vals.add(numeric ? (Object) rs.getBigDecimal(1) : (Object) rs.getString(1));
+        }
         rs.close();
         return vals;
     }
 
-    /** UPDATE val=? WHERE id=? 逐行写回 */
-    static void writeBack(Connection conn, List<Object> marked) throws Exception {
+    /**
+     * UPDATE 目标列写回。
+     * <p>下标 i 直接当 id：仅在「未删行」时调用（嵌入后立即写回），此时序列与 id 一一对应。</p>
+     */
+    static void writeBack(Connection conn, List<Object> marked, String kind) throws Exception {
+        boolean numeric = NUM.equals(kind);
+        String col = numeric ? "num" : "val";
         PreparedStatement ps = conn.prepareStatement(
-            "UPDATE " + TABLE + " SET val = ? WHERE id = ?");
+            "UPDATE " + TABLE + " SET " + col + " = ? WHERE id = ?");
         for (int i = 0; i < marked.size(); i++) {
-            ps.setString(1, String.valueOf(marked.get(i)));
+            Object v = marked.get(i);
+            if (numeric) {
+                ps.setBigDecimal(1, new BigDecimal(String.valueOf(v)));
+            } else {
+                ps.setString(1, String.valueOf(v));
+            }
             ps.setInt(2, i);
             ps.addBatch();
         }
@@ -209,10 +282,10 @@ public class MinDeleteDemoDb {
 
     static void check(WatermarkResult<String> r) {
         if (r.isSuccess()) {
-            p("    -> OK   还原 payload=\"" + r.getData()
+            p("     -> OK   还原 payload=\"" + r.getData()
                 + "\"（置信度 " + String.format("%.1f", r.getConfidence()) + "%）");
         } else {
-            p("    -> FAIL " + r.getMessage());
+            p("     -> FAIL " + r.getMessage());
         }
     }
 
