@@ -46,11 +46,10 @@ public class DatabaseWatermarkerTest {
     private static final String PAYLOAD = "secret-payload-2026";
     private static final WatermarkConfig CONFIG = new WatermarkConfig("test-secret");
     /**
-     * 简单策略组合：必须同时包含两种 simple 策略才能可靠提取。
-     * 原因：core 内部注册顺序为 SuffixMarker → InvisiblePadding，
-     * extract 使用 {@code findAnySimpleStrategy} 时返回第一个匹配的
-     * （SuffixMarker）；如果 embed 只用 InvisiblePadding，extract
-     * 会用 SuffixMarker 找不到标记而失败。
+     * 简单策略组合：同时包含两种 simple 策略（历史遗留约定，修复后<b>不再必须</b>）。
+     * 提取端现已按单元格上的水印痕迹自动消歧（extractSimple 逐个尝试候选策略），
+     * 单独用任一 simple 策略嵌入均可可靠提取（见 core.simple.SimpleExtractRoutingTest）。
+     * 此处保留两种以维持既有行为覆盖。
      */
     private static final List<WatermarkType> SIMPLE_STRATEGIES = Arrays.asList(
         WatermarkType.SIMPLE_SUFFIX_MARKER,

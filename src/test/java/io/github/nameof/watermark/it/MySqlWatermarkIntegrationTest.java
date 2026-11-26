@@ -47,9 +47,8 @@ import static org.junit.Assert.assertTrue;
  * {@link #tearDown()} 通过 DELETE + INSERT 把表恢复到快照状态（使用显式主键，保证
  * PK 值不变）。多次运行不会污染原始数据。
  *
- * <p><b>策略选择</b>：同时使用 {@code SIMPLE_SUFFIX_MARKER} + {@code SIMPLE_INVISIBLE_PADDING}
- * ——core 内部策略注册顺序是 SuffixMarker 优先，单独用 InvisiblePadding 无法可靠提取
- * （详见 {@code core.Watermarker.findAnySimpleStrategy}）。
+ * <p><b>策略选择</b>：仅使用 {@code SIMPLE_SUFFIX_MARKER}（见 {@link #SIMPLE_STRATEGIES}
+ * 的说明：短字段长度约束所致，与提取路由无关——提取端已按水印痕迹自动消歧）。
  *
  * <p><b>运行</b>：
  * <pre>
@@ -87,8 +86,7 @@ public class MySqlWatermarkIntegrationTest {
      * 即使 VARCHAR(50) 也容纳不下。SuffixMarker 仅追加
      * {@code [::payload::]} 标记（payload=10 → 18 字符），短字段也可承载。
      *
-     * <p>提取时 {@code core.Watermarker.findAnySimpleStrategy} 优先匹配 SuffixMarker
-     * （registry 顺序），所有有水印的单元格都能被识别，无需配合 InvisiblePadding。
+     * <p>提取端按单元格上的水印痕迹自动消歧（无需与嵌入端策略一致）。
      */
     private static final List<WatermarkType> SIMPLE_STRATEGIES = Collections.singletonList(
         WatermarkType.SIMPLE_SUFFIX_MARKER
